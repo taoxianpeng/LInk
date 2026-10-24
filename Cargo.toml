@@ -1,0 +1,28 @@
+[package]
+name = "link-ink"
+version = "0.1.0"
+edition = "2021"
+description = "LInk screen annotation overlay for X11"
+license = "MIT"
+
+[[bin]]
+name = "link-ink"
+path = "src/main.rs"
+
+[dependencies]
+gtk = { version = "0.19", features = ["v3_24"] }
+cairo-rs = "0.22"
+glib = "0.22"
+flate2 = "1"
+quick-xml = "0.42"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+thiserror = "2"
+log = "0.4"
+env_logger = "0.11"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gdkx11 = "0.19"
+x11rb = { version = "0.14", features = ["xfixes", "randr"] }
+
+[dev-dependencies]
+tempfile = "3"
