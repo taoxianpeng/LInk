@@ -97,7 +97,7 @@ fn frame_cost(
             cr.rectangle(x, y, w, h);
             cr.clip();
         }
-        link_ink::ui::overlay::draw(&cr, app, view, cache);
+        link_ink::ui::overlay::draw(&cr, app, view, cache, None);
         drop(cr);
         target.flush();
     }

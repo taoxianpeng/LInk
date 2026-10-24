@@ -5,8 +5,8 @@ pub mod x11;
 
 /// 当前构建实际使用的后端。
 ///
-/// 上层（`main.rs`、`ui/`）只通过这个名字使用平台能力；接入 Windows 时
-/// 只需在此处按 `cfg` 指向 `platform::win`，装配代码不用改。
+/// 上层只通过这个名字使用平台能力；接入 Windows 时只需在此处按 `cfg`
+/// 指向 `platform::win`，装配代码不用改。
 #[cfg(target_os = "linux")]
 pub use x11::{compositor_active, overlay, X11Platform as Platform};
 

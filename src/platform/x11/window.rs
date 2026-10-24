@@ -8,7 +8,7 @@ use x11rb::protocol::xfixes::ConnectionExt as XfixesConnectionExt;
 use x11rb::protocol::xproto::{ConnectionExt as XprotoConnectionExt, Rectangle};
 use x11rb::rust_connection::RustConnection;
 
-use crate::platform::PlatformError;
+use crate::platform::{PlatformError, RectI};
 
 pub fn xid_of(window: &gdk::Window) -> Option<u32> {
     window
@@ -20,6 +20,17 @@ pub fn apply_input_region(
     conn: &RustConnection,
     windows: &[gdk::Window],
     passthrough: bool,
+) -> Result<(), PlatformError> {
+    apply_input_region_excluding(conn, windows, passthrough, None)
+}
+
+/// 与 [`apply_input_region`] 相同，但可以把 `exclude` 这块矩形从输入区域里挖掉
+/// （画布用：面板那块留给面板，点击不会被全屏覆盖层吃掉）。
+pub fn apply_input_region_excluding(
+    conn: &RustConnection,
+    windows: &[gdk::Window],
+    passthrough: bool,
+    exclude: Option<RectI>,
 ) -> Result<(), PlatformError> {
     let mut seen = HashSet::new();
     let mut applied = 0usize;
@@ -33,7 +44,7 @@ pub fn apply_input_region(
         if !seen.insert(xid) {
             continue;
         }
-        match apply_one(conn, xid, passthrough) {
+        match apply_one(conn, xid, passthrough, exclude) {
             Ok(()) => applied += 1,
             Err(err) => {
                 log::warn!("XID {xid:#x} 应用输入区域失败: {err}");
@@ -51,7 +62,12 @@ pub fn apply_input_region(
     Ok(())
 }
 
-fn apply_one(conn: &RustConnection, xid: u32, passthrough: bool) -> Result<(), PlatformError> {
+fn apply_one(
+    conn: &RustConnection,
+    xid: u32,
+    passthrough: bool,
+    exclude: Option<RectI>,
+) -> Result<(), PlatformError> {
     let region = conn
         .generate_id()
         .map_err(|err| PlatformError::X11Request(err.to_string()))?;
@@ -68,12 +84,16 @@ fn apply_one(conn: &RustConnection, xid: u32, passthrough: bool) -> Result<(), P
             .map_err(|err| PlatformError::X11Request(err.to_string()))?
             .reply()
             .map_err(|err| PlatformError::X11Request(err.to_string()))?;
-        vec![Rectangle {
+        let full = Rectangle {
             x: 0,
             y: 0,
             width: geometry.width,
             height: geometry.height,
-        }]
+        };
+        match exclude {
+            Some(cut) => subtract_rect(full, cut),
+            None => vec![full],
+        }
     };
 
     conn.xfixes_create_region(region, &rectangles)
@@ -103,4 +123,61 @@ fn apply_one(conn: &RustConnection, xid: u32, passthrough: bool) -> Result<(), P
         })?;
 
     Ok(())
+}
+
+/// 用最多 4 个矩形表示「整块减去一块」。
+fn subtract_rect(full: Rectangle, cut: RectI) -> Vec<Rectangle> {
+    let fx0 = full.x as i32;
+    let fy0 = full.y as i32;
+    let fx1 = fx0 + full.width as i32;
+    let fy1 = fy0 + full.height as i32;
+    let cx0 = cut.x;
+    let cy0 = cut.y;
+    let cx1 = cx0 + cut.width as i32;
+    let cy1 = cy0 + cut.height as i32;
+
+    if cx1 <= fx0 || cy1 <= fy0 || cx0 >= fx1 || cy0 >= fy1 {
+        return vec![full];
+    }
+
+    let mut out = Vec::new();
+    let top = (cy0 - fy0).max(0);
+    if top > 0 {
+        out.push(Rectangle {
+            x: fx0 as i16,
+            y: fy0 as i16,
+            width: full.width,
+            height: top as u16,
+        });
+    }
+    let bottom = (fy1 - cy1).max(0);
+    if bottom > 0 {
+        out.push(Rectangle {
+            x: fx0 as i16,
+            y: cy1 as i16,
+            width: full.width,
+            height: bottom as u16,
+        });
+    }
+    let band_top = cy0.max(fy0);
+    let band_height = (cy1.min(fy1) - band_top).max(0) as u16;
+    let left = (cx0 - fx0).max(0);
+    if left > 0 && band_height > 0 {
+        out.push(Rectangle {
+            x: fx0 as i16,
+            y: band_top as i16,
+            width: left as u16,
+            height: band_height,
+        });
+    }
+    let right = (fx1 - cx1).max(0);
+    if right > 0 && band_height > 0 {
+        out.push(Rectangle {
+            x: cx1 as i16,
+            y: band_top as i16,
+            width: right as u16,
+            height: band_height,
+        });
+    }
+    out
 }

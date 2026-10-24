@@ -235,7 +235,7 @@ fn cached_overlay_draw_matches_direct_rendering() {
     let mut cached = target();
     {
         let cr = Context::new(&cached).expect("ctx");
-        link_ink::ui::overlay::draw(&cr, &app, &view, &mut cache);
+        link_ink::ui::overlay::draw(&cr, &app, &view, &mut cache, None);
     }
 
     let mut direct = target();

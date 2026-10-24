@@ -114,6 +114,41 @@ pub fn render(
     })
 }
 
+/// 渲染某一图层的缩略图（白底）并编码为 PNG。面板用它显示图层预览。
+pub fn layer_thumbnail_png(
+    layer: &crate::model::Layer,
+    page_width_pt: f64,
+    page_height_pt: f64,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, ExportError> {
+    if width == 0 || height == 0 {
+        return Err(ExportError::InvalidSize);
+    }
+    let mut surface = ImageSurface::create(Format::ARgb32, width as i32, height as i32)?;
+    {
+        let context = Context::new(&surface)?;
+        render::draw_layer_thumbnail(
+            &context,
+            layer,
+            page_width_pt,
+            page_height_pt,
+            width as f64,
+            height as f64,
+        )?;
+    }
+    surface.flush();
+    let rgba = read_rgba(&mut surface)?;
+    encode(
+        &ExportedImage {
+            width,
+            height,
+            rgba,
+        },
+        ImageFormat::Png,
+    )
+}
+
 pub fn save(path: &Path, format: ImageFormat, image: &ExportedImage) -> Result<(), ExportError> {
     fs::write(path, encode(image, format)?)?;
     Ok(())

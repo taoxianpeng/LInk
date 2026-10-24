@@ -1,5 +1,6 @@
 pub mod app;
 pub mod cache;
+pub mod canvas_app;
 pub mod export;
 pub mod input;
 pub mod model;

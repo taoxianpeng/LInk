@@ -1,13 +1,24 @@
 [package]
 name = "link-ink"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "LInk screen annotation overlay for X11"
 license = "MIT"
 
+default-run = "link-ink-panel"
+
+# 用户入口：egui 面板（会自己拉起下面的画布进程）。
 [[bin]]
-name = "link-ink"
-path = "src/main.rs"
+name = "link-ink-panel"
+path = "apps/panel/src/main.rs"
+
+# 原生画布进程：全屏透明覆盖层 + 压感 + 渲染 + xopp/导出。
+[[bin]]
+name = "link-ink-canvas"
+path = "src/canvas_main.rs"
+
+[workspace]
+members = ["crates/link-ipc"]
 
 [dependencies]
 gtk = { version = "0.19", features = ["v3_24"] }
@@ -19,10 +30,27 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 thiserror = "2"
 log = "0.4"
 env_logger = "0.11"
+link-ipc = { path = "crates/link-ipc" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+
+# egui 面板（link-ink-panel）。纯 Rust，无 webview。
+eframe = { version = "0.37", default-features = false, features = [
+    "glow",
+    "default_fonts",
+    "system_fonts",
+    "x11",
+    "wayland",
+    "clipboard",
+] }
+egui = "0.37"
+rfd = "0.17"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gdkx11 = "0.19"
 x11rb = { version = "0.14", features = ["xfixes", "randr"] }
+raw-window-handle = "0.6"
 
 [dev-dependencies]
 tempfile = "3"

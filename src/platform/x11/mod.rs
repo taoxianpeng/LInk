@@ -119,6 +119,16 @@ impl X11Platform {
         Ok(())
     }
 
+    /// 把输入区域设为「窗口 − exclude」（穿透时为空）。
+    pub fn apply_input_region_excluding(
+        &self,
+        windows: &[gdk::Window],
+        passthrough: bool,
+        exclude: Option<crate::platform::RectI>,
+    ) -> Result<(), PlatformError> {
+        window::apply_input_region_excluding(&self.conn, windows, passthrough, exclude)
+    }
+
     pub fn reapply_input_region(&self, windows: &[gdk::Window]) -> Result<(), PlatformError> {
         window::apply_input_region(&self.conn, windows, self.passthrough.get())
     }
