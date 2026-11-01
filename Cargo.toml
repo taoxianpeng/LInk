@@ -1,6 +1,6 @@
 [package]
 name = "link-ink"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "LInk screen annotation overlay for X11"
 license = "MIT"
