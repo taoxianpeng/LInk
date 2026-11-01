@@ -24,6 +24,7 @@ pub enum Glyph {
     Export,
     Trash,
     Close,
+    Gear,
 }
 
 /// 绕 `center` 旋转 `angle` 弧度。
@@ -314,6 +315,21 @@ pub fn paint(painter: &Painter, rect: Rect, glyph: Glyph, color: Color32) {
                         Pos2::new(c.x + dx * 0.8 * s, bottom - 0.18 * s),
                     ],
                     Stroke::new(stroke.width * 0.8, color),
+                );
+            }
+        }
+        Glyph::Gear => {
+            painter.circle_stroke(c, 0.34 * s, stroke);
+            painter.circle_filled(c, 0.13 * s, color);
+            for index in 0..8 {
+                let angle = index as f32 / 8.0 * std::f32::consts::TAU;
+                let (sin, cos) = angle.sin_cos();
+                painter.line_segment(
+                    [
+                        Pos2::new(c.x + cos * 0.50 * s, c.y + sin * 0.50 * s),
+                        Pos2::new(c.x + cos * 0.78 * s, c.y + sin * 0.78 * s),
+                    ],
+                    Stroke::new(stroke.width * 1.1, color),
                 );
             }
         }

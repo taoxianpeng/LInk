@@ -9,8 +9,12 @@ use std::io::{BufRead, Write};
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-/// 协议版本。面板与画布不一致时画布返回 [`Event::Error`] 而不是崩溃。
-pub const PROTOCOL_VERSION: u32 = 1;
+/// 协议版本。
+///
+/// **改动 [`Command`] 或 [`Event`] 的变体时必须把它 +1**：面板与画布是两个可执行文件，
+/// 很容易出现"新面板配旧画布"（例如 `cargo run --release` 只重建了面板）。
+/// 版本号对不上时手会直接失败并给出明确提示，而不是像以前那样命令被静默丢弃。
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -76,6 +80,8 @@ pub enum Command {
         visible: bool,
     },
     ClearLayer,
+    /// 撤回上一步（Ctrl+Z）：删掉最近一笔，或恢复刚被擦掉/清空的笔迹。
+    Undo,
     SetPassthrough {
         enabled: bool,
     },
@@ -223,6 +229,7 @@ mod tests {
                 rgba: [12, 34, 56, 255],
             },
             Command::LayerMove { up: true },
+            Command::Undo,
             Command::ExportImage {
                 path: "/tmp/a.png".to_string(),
                 format: ImageFormatDto::Jpeg,

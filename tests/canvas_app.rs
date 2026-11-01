@@ -204,3 +204,38 @@ fn save_and_reload_xopp_through_ipc_commands() {
     assert!(matches!(events.first(), Some(Event::Opened { .. })));
     assert!(matches!(events.last(), Some(Event::State { .. })));
 }
+
+#[test]
+fn undo_command_removes_last_stroke_and_reports_state() {
+    use link_ink::input::{InputEvent, PointerSample, ToolKind};
+
+    let (mut canvas, mut host) = setup();
+    let view = canvas.view();
+    let sample = |x: f64| PointerSample {
+        logical: (x, 100.0),
+        pressure: 1.0,
+        pressure_available: false,
+        device_has_pressure: false,
+        tool: ToolKind::Mouse,
+        device_name: "测试鼠标".to_string(),
+        tilt: None,
+        shift: false,
+    };
+
+    // 画一笔
+    canvas.on_input(InputEvent::Down(sample(50.0)));
+    canvas.on_input(InputEvent::Move(sample(120.0)));
+    canvas.on_input(InputEvent::Up(sample(200.0)));
+    let _ = view;
+
+    let events = canvas.handle_command(Command::Undo, &mut host);
+    assert!(
+        matches!(events.first(), Some(Event::State { .. })),
+        "撤回后应回传状态，实际 {events:?}"
+    );
+    assert!(canvas.take_redraw(), "撤回需要重绘");
+
+    // 再撤一次没有内容，不应产生状态事件
+    let events = canvas.handle_command(Command::Undo, &mut host);
+    assert!(events.is_empty(), "空历史不该回状态，实际 {events:?}");
+}

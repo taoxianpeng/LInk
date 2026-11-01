@@ -513,3 +513,122 @@ fn mouse_stroke_stays_constant_even_after_pen_pressure_seen() {
         "鼠标笔迹不应因为之前用过笔就变成压感笔迹"
     );
 }
+
+// ---- 撤回（Ctrl+Z） ----
+
+fn draw_stroke(app: &mut App, view: &ViewTransform, y: f64) {
+    app.handle_input(InputEvent::Down(mouse(50.0, y)), view);
+    app.handle_input(InputEvent::Move(mouse(150.0, y)), view);
+    app.handle_input(InputEvent::Up(mouse(250.0, y)), view);
+}
+
+#[test]
+fn undo_removes_the_last_stroke() {
+    let (view, document) = view_and_document();
+    let mut app = App::new(document);
+    draw_stroke(&mut app, &view, 100.0);
+    draw_stroke(&mut app, &view, 200.0);
+    assert_eq!(app.document.active_layer().strokes.len(), 2);
+
+    let first = app.document.active_layer().strokes[0].clone();
+
+    let result = app.undo().expect("应能撤回");
+    assert_eq!(result.layer, 0);
+    assert!(!result.restored, "撤回新增笔迹不是恢复操作");
+    assert_eq!(
+        app.document.active_layer().strokes,
+        vec![first],
+        "剩下的是先画的那一笔"
+    );
+}
+
+#[test]
+fn undo_stops_at_the_history_limit() {
+    let (view, document) = view_and_document();
+    let mut app = App::new(document);
+    const TOTAL: usize = 55; // 超过 50 条上限
+    for index in 0..TOTAL {
+        draw_stroke(&mut app, &view, 20.0 + index as f64 * 5.0);
+    }
+    assert_eq!(app.document.active_layer().strokes.len(), TOTAL);
+    assert_eq!(app.undo_depth(), 50, "最多保留 50 步");
+
+    let mut undone = 0;
+    while app.undo().is_some() {
+        undone += 1;
+    }
+    assert_eq!(undone, 50);
+    // 最早的 5 笔已经不能被撤回
+    assert_eq!(app.document.active_layer().strokes.len(), TOTAL - 50);
+}
+
+#[test]
+fn undo_after_erase_restores_the_stroke() {
+    let (view, document) = view_and_document();
+    let mut app = App::new(document);
+    draw_stroke(&mut app, &view, 100.0);
+    assert_eq!(app.document.active_layer().strokes.len(), 1);
+
+    // 用橡皮划一整条横线把笔迹擦掉
+    app.settings.tool = Tool::Eraser;
+    app.handle_input(InputEvent::Down(mouse(50.0, 100.0)), &view);
+    app.handle_input(InputEvent::Move(mouse(150.0, 100.0)), &view);
+    app.handle_input(InputEvent::Up(mouse(250.0, 100.0)), &view);
+    assert_eq!(app.document.active_layer().strokes.len(), 0, "擦除生效");
+
+    let result = app.undo().expect("应能恢复被擦掉的笔迹");
+    assert!(result.restored);
+    assert_eq!(app.document.active_layer().strokes.len(), 1);
+}
+
+#[test]
+fn undo_on_empty_history_is_a_no_op() {
+    let (_view, document) = view_and_document();
+    let mut app = App::new(document);
+    assert!(app.undo().is_none());
+    assert!(!app.is_dirty(), "没有可撤回内容时不应把文档标脏");
+}
+
+#[test]
+fn undo_works_across_layers() {
+    let (view, document) = view_and_document();
+    let mut app = App::new(document);
+    draw_stroke(&mut app, &view, 100.0); // 图层 1
+
+    app.document.add_layer_above_active(); // 切到图层 2
+    assert_eq!(app.document.active, 1);
+    draw_stroke(&mut app, &view, 200.0);
+
+    assert!(app.undo().is_some());
+    assert_eq!(
+        app.document.layers[1].strokes.len(),
+        0,
+        "撤的是当前层那一笔"
+    );
+    assert_eq!(app.document.layers[0].strokes.len(), 1, "另一层不受影响");
+
+    // 继续撤回会把图层 1 的笔迹也撤掉（即使当前停留在图层 2）
+    assert!(app.undo().is_some());
+    assert_eq!(app.document.layers[0].strokes.len(), 0);
+}
+
+#[test]
+fn undoing_mid_stroke_discards_the_draft_only() {
+    let (view, document) = view_and_document();
+    let mut app = App::new(document);
+    draw_stroke(&mut app, &view, 100.0);
+    assert_eq!(app.document.active_layer().strokes.len(), 1);
+
+    // 正在画第二笔
+    app.handle_input(InputEvent::Down(mouse(50.0, 200.0)), &view);
+    app.handle_input(InputEvent::Move(mouse(120.0, 200.0)), &view);
+    assert!(app.is_drawing());
+
+    assert!(app.undo().is_none(), "画到一半先丢弃草稿");
+    assert!(!app.is_drawing());
+    assert_eq!(
+        app.document.active_layer().strokes.len(),
+        1,
+        "已提交的那一笔不应被撤掉"
+    );
+}

@@ -58,22 +58,39 @@ pub fn draw(
         }
     }
 
+    // 草稿要夹在它自己那一层的位置：先画草稿，再把**当前层之上**的笔迹盖回来。
+    let cull_pt = damage.map(|(x0, y0, x1, y1)| {
+        let a = view.logical_to_page(x0, y0);
+        let b = view.logical_to_page(x1, y1);
+        let (ax, ay) = (a.x, a.y);
+        let (bx, by) = (b.x, b.y);
+        (ax.min(bx), ay.min(by), ax.max(bx), ay.max(by))
+    });
+    let active = app.document.active;
+    let paint_draft = |cr: &Context| {
+        if let Some(draft) = &draft {
+            let _ = render::draw_stroke(cr, draft, view);
+            let _ = render::draw_layers_above(cr, &app.document, active, view, cull_pt);
+        }
+    };
+
     if area > ATOMIC_COMPOSE_MAX_AREA {
         // 大区域：直接画，少一份中间表面。
         let _ = cache.paint(cr);
         cr.set_operator(cairo::Operator::Over);
-        if let Some(draft) = &draft {
-            let _ = render::draw_stroke(cr, draft, view);
-        }
+        paint_draft(cr);
     } else {
         cr.push_group();
         // 组内先放已提交笔迹（Source 覆盖，顺带清掉上一帧草稿），再叠当前草稿。
         let _ = cache.paint(cr);
         cr.set_operator(cairo::Operator::Over);
-        if let Some(draft) = &draft {
-            let _ = render::draw_stroke(cr, draft, view);
-        }
+        paint_draft(cr);
         if cr.pop_group_to_source().is_ok() {
+            // 关键：必须用 Source 把整块裁剪区替换掉。
+            // 组里没有笔迹的地方是**透明**的，用 Over 贴回去时这些像素不会被覆盖，
+            // 上一帧的图形就留在了屏幕上 —— 形状工具拖动时的一片残影就是这么来的
+            // （自由笔迹一直是向外长，新旧完全重叠，所以看不出来）。
+            cr.set_operator(cairo::Operator::Source);
             let _ = cr.paint();
         }
     }

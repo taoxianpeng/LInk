@@ -37,7 +37,8 @@ link-ink-panel (eframe/egui)  ──JSON lines(stdin/stdout)──▶  link-ink-
 | 图层缩略图 | ✅ | 每行一个缩略图，随内容变化**只重绘不重建**；点击打开放大预览窗口 |
 | 保存 / 打开工程 | ✅ | `.xopp`（gzip XML），保留颜色、线宽、压感、图层与顺序 |
 | 导出图片 | ✅ | PNG / JPEG，背景可选「空白白底」或「当前屏幕」 |
-| 撤销 / 重做 | ❌ | 本期未实现 |
+| 撤回 | ✅ | `Ctrl+Z` 撤掉最近一笔（或恢复刚擦掉的笔迹），最多 50 步 |
+| 重做 | ❌ | 本期未实现 |
 | Wayland / Windows 后端 | ❌ | 仅做边界预留，见下文 |
 
 ## 构建与运行
@@ -50,12 +51,16 @@ sudo apt install libgtk-3-dev libcairo2-dev pkg-config libx11-dev \
 ```
 
 ```bash
-cargo build --release        # 产出 target/release/{link-ink-panel, link-ink-canvas}
-cargo run --release          # 启动 egui 面板（默认二进制，会自动拉起画布）
+cargo build --workspace --release   # 产出 target/release/{link-ink-panel, link-ink-canvas}
+cargo run --release                 # 启动 egui 面板（默认二进制，会自动拉起画布）
 cargo run --release --bin link-ink-canvas   # 只启动画布（通常由面板拉起，调试用）
 ```
 
 打包时把两个可执行文件放在同一目录即可：面板会先找同目录，其次看 `LINK_CANVAS_BIN`。
+
+> ⚠️ **改完代码请用 `cargo build --workspace`**：`cargo run` 只重建它要运行的那一个二进制，
+> 画布可能还是旧的。两个进程靠 `link-ipc` 的协议版本握手，版本对不上时面板会直接提示
+> “画布与面板版本不一致”，而不是让命令悄悄失效（改协议时记得同步 +1 `PROTOCOL_VERSION`）。
 
 需要**合成器**（Muffin / Mutter / picom 等）才能正确显示透明窗口；缺失时程序会弹窗警告。
 画布只覆盖主显示器，副屏不受影响。
@@ -70,6 +75,7 @@ cargo run --release --bin link-ink-canvas   # 只启动画布（通常由面板�
 | `L` / `R` / `O` | 直线 / 矩形 / 椭圆 |
 | `F8` | 切换穿透 |
 | `Ctrl+S` / `Ctrl+O` / `Ctrl+E` | 保存工程 / 打开工程 / 导出图片 |
+| `Ctrl+Z` | 撤回上一步（最多 50 步） |
 
 绘制时按住 `Shift` 约束为正方形 / 正圆。笔宽、gamma、最小宽度比例**只影响之后的新笔迹**，
 不会回溯修改已提交的笔迹。
@@ -127,12 +133,27 @@ xournalpp -i target/verify/link_sample.png target/verify/link_sample.xopp
   窗口按页面比例放大显示该层，内容变化时会自动刷新。
 - **名字**：点进输入框直接改，回车或失焦提交；空名字会被拒绝并恢复原名。图层名会写入 `.xopp`。
 - 在隐藏图层上落笔时该层会自动显示，避免"画完笔迹凭空消失"。
+- **叠放顺序**：列表越靠上 = 图层越靠上（和 Photoshop 一致）。在非顶层书写时，
+  草稿也会被上方图层实时遮住，不会"画的时候浮在上面、松手才掉下去"。
 
 实现要点：
 
 1. 缩略图由画布进程渲染成 PNG（base64）随 `state` 事件下发，面板解码成 egui 纹理并按图层 id 复用。
 2. 改名用一个小弹窗完成，避免行内输入框与列表刷新互相干扰。
 3. 点缩略图打开放大预览窗口，内容变化时自动刷新。
+
+## 撤回（Ctrl+Z）
+
+- **撤掉最近一笔**：每画一笔（自由笔迹或直线/矩形/椭圆）记一步，`Ctrl+Z` 把那一笔删掉。
+- **擦除也能撤**：用橡皮擦掉的笔迹会回到原来的位置和叠放顺序，而不是"撤掉别的笔"。
+- **清空图层可撤**：清空后按 `Ctrl+Z` 整层笔迹原样回来。
+- **上限 50 步**：超过后丢弃最早的记录；上限常量是 `src/undo.rs` 里的 `UNDO_LIMIT`。
+- **画到一半按 Ctrl+Z**：只丢弃当前这一笔的草稿，不会撤掉已提交的笔迹。
+- **跨图层正确**：记录用图层的稳定 id 定位，增删/移动图层后依然撤到正确的那一层。
+- 打开工程会清空历史（旧记录指向的笔迹已不存在）。
+
+实现上只保存差异（被加或被删的笔迹），不存整份文档快照，所以内存与图层数无关。
+测试：`src/undo.rs` 的 5 个单元测试 + `tests/app_state.rs` 的 6 个撤回用例。
 
 ## 性能：为什么笔画多了也不会闪
 
@@ -227,13 +248,14 @@ egui 界面 ─► ipc 客户端（子进程 stdin/stdout）─► 同样的 lin
 ## 测试
 
 ```bash
-cargo test                                   # 63 个用例
+cargo test --workspace                       # 93 个用例
 cargo clippy --all-targets -- -D warnings     # 无告警
 cargo fmt --check
 ```
 
 覆盖范围：坐标往返与 HiDPI 映射、压感映射与参数净化、变宽笔迹渲染轮廓、图层 z 序、
-xopp 读写 round-trip 与宽度 token 规则、错误输入回退、图片导出合成与 PNG/JPEG 编码。
+xopp 读写 round-trip 与宽度 token 规则、错误输入回退、图片导出合成与 PNG/JPEG 编码、
+撤回栈（上限/跨图层/擦除恢复）、画布 IPC 命令处理。
 
 ## 实机验证结果
 
@@ -255,6 +277,7 @@ xopp 读写 round-trip 与宽度 token 规则、错误输入回退、图片导�
 - [x] 点「保存工程」弹出文件对话框期间，面板仍可点击（穿透开关即时生效），不再出现
   “LInk is not responding”。
 - [x] 中文界面渲染正常（系统字体回退），无缺字。
+- [x] `Ctrl+Z` 撤回：画 3 条 → 按 2 次剩 1 条；橡皮擦掉后再按一次，笔迹原样恢复（截图确认）。
 
 **仍需你在真机上确认**：
 
@@ -286,12 +309,36 @@ xopp 读写 round-trip 与宽度 token 规则、错误输入回退、图片导�
     egui 的更新循环会被一直阻塞，窗口管理器几秒后判定 “not responding”。
     现在对话框在工作线程里弹（Linux 优先 zenity/kdialog，其次 rfd portal），
     主线程每帧非阻塞轮询结果（`apps/panel/src/dialog.rs`）。不要在 `update()` 里调阻塞式对话框。
-11. **写字时笔迹闪烁（v0.2 画布进程）**：脏矩形虽然算对了（10–20 px），但 GTK 在合成器的
+11. **撤回条目要按图层 id 而不是索引定位**：只记索引的话，新建/删除/移动图层后
+    再按 Ctrl+Z 会撤到别的层上，甚至删错笔迹。`Edit` 里存的是 `Layer::id`（不写进 xopp、
+    不参与相等比较），撤回时先按 id 找层，找不到就跳过该条继续往前。
+12. **写字时笔迹闪烁（v0.2 画布进程）**：脏矩形虽然算对了（10–20 px），但 GTK 在合成器的
     透明窗口上交给 `draw` 处理器的**裁剪区是整个窗口**，于是每个笔尖事件都变成整屏重绘
     （270 万 px²，约 6–7ms），"擦掉草稿 → 重画草稿"的间隙被合成器采到，看起来就是闪烁。
     现在把脏矩形自己记下来，在 `ui::overlay::draw` 里按它 `clip()`，强制走原子合成分支：
     实测帧裁剪面积 ~300–60000 px²、每帧 0.06–0.25ms。整屏重绘的三处入口必须先清掉这个提示。
-12. **全屏覆盖层吞掉面板点击**：画布是后创建的全屏置顶窗口，压在面板上面；窗口管理器
+13. **`Ctrl+Z` 没反应、日志刷 `unknown variant undo`**：面板已经发出 `undo`，但磁盘上的
+    画布还是旧版本（`cargo run --release` 只重建了面板，`link-ink-canvas` 停留在上一次构建）。
+    旧画布解析不了新命令，只能打一行 warn 然后丢弃，界面上看起来就是"按键没反应"。
+    现在两边握手时比对 `PROTOCOL_VERSION`，不一致就直接弹提示让用户 `cargo build --workspace`。
+    **改动 `Command`/`Event` 变体时必须把 `PROTOCOL_VERSION` +1。**
+14. **在非顶层书写时笔迹浮在最上面**：草稿是每帧单独画的（不在缓存里），早先直接画在
+    所有图层之上，所以在上层有笔迹的情况下，在下层书写会看到笔迹盖住上层，提交后才跳回正确位置。
+    现在草稿画完后再把**当前层之上**的笔迹盖回来（`render::draw_layers_above`），
+    并按本帧脏矩形的包围盒裁剪，只有相交的笔迹才重画（实测书写帧仍是 0.15ms）。
+    回归测试：`tests/render_cache.rs::draft_on_lower_layer_is_covered_by_upper_layers`。
+15. **点图层名选不中图层**：名字区域几乎盖满整行，且只处理了双击改名，单击被它吃掉。
+    现在单击 = 选中，双击 = 选中并改名。
+16. **矩形/椭圆/直线拖动时一片残影**：两个原因叠加。
+    其一，离屏组最后用 `Operator::Over` 贴回窗口，而组里没有笔迹的地方是透明的，
+    `Over` 不会覆盖这些像素，上一帧的图形就留在屏幕上（自由笔迹一直向外长、新旧完全重叠，
+    所以从来没人发现）。**小区域原子合成的最后一步必须用 `Source`**。
+    其二，`pending_draw` 是覆盖而不是累加，GTK 把多个指针事件合并成一次绘制时只保留了
+    最后一个矩形，之前那些区域根本没被重绘。现在用 `DrawScope` 做并集合并，
+    整屏重绘的请求优先级最高。回归测试：`tests/render_cache.rs` 的
+    `shape_preview_does_not_leave_ghosts_between_frames`、`src/canvas_main.rs` 的
+    `draw_scope_tests`。
+17. **全屏覆盖层吞掉面板点击**：画布是后创建的全屏置顶窗口，压在面板上面；窗口管理器
     （Cinnamon/Muffin）会忽略 `ConfigureWindow(Above)` 与 `_NET_RESTACK_WINDOW`，甚至忽略
     `ViewportCommand::Focus` 的抬升。真正的解法是把画布的 XFixes 输入区域设成
     「整屏 − 面板矩形」，并且**顶层窗口和 DrawingArea 子窗口都要设置**，每 400 ms 重算一次。

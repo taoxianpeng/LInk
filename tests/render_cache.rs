@@ -342,3 +342,121 @@ fn toggling_visibility_rebuilds_cache() {
     let mut surface = paint(&cache);
     assert_eq!(read_pixel(&mut surface, 40, 13)[3], 0);
 }
+
+/// 草稿必须画在"它自己那一层"的位置：在底层书写时，上层笔迹要盖住草稿。
+///
+/// 回归用例：早先草稿永远画在所有图层之上，导致在非顶层书写时笔迹会浮在上面，
+/// 只有提交（重新合成缓存）后才跳回正确位置，表现为"画的时候在上、松手就跑到下面"。
+#[test]
+fn draft_on_lower_layer_is_covered_by_upper_layers() {
+    use link_ink::input::InputEvent;
+
+    let mut document = document();
+    // 上层（index 1）放一条黑色横线，横跨即将书写的区域
+    document.add_layer_above_active();
+    document.layers[1]
+        .strokes
+        .push(horizontal_stroke(15.0, Rgba::BLACK));
+    // 回到下层书写
+    document.active = 0;
+
+    let mut app = link_ink::app::App::new(document);
+    app.settings.color = Rgba::new(255, 0, 0, 255); // 红色草稿，便于区分
+    let view = view();
+
+    // 起笔并移动，草稿仍在绘制中。
+    // 页面 75x37.5pt、逻辑 100x50 ⇒ 1.3333 倍：上层黑线在页面 y=15pt，对应逻辑 y=20。
+    app.handle_input(InputEvent::Down(pen(20.0, 20.0)), &view);
+    app.handle_input(InputEvent::Move(pen(60.0, 20.0)), &view);
+    assert!(app.is_drawing(), "应处于绘制中");
+    assert_eq!(app.document.active, 0);
+
+    let mut cache = OverlayCache::new(&monitor(), 2.0);
+    let mut surface = target();
+    {
+        let cr = Context::new(&surface).expect("ctx");
+        link_ink::ui::overlay::draw(&cr, &app, &view, &mut cache, None);
+    }
+
+    // 逻辑坐标 (20,20) → 物理 (40,40)；上层黑线在这里，必须盖住红色草稿
+    let pixel = read_pixel(&mut surface, 40, 40);
+    assert!(
+        pixel[0] < 60 && pixel[1] < 60 && pixel[2] < 60,
+        "上层笔迹应盖住草稿，实际像素 {pixel:?}（红色说明草稿浮到了上面）"
+    );
+}
+
+/// 连续两帧：形状工具的预览每帧都在变，第二帧必须把第一帧的图形擦干净。
+///
+/// 回归用例：离屏组里没有笔迹的地方是透明的，若用 `Over` 贴回窗口，
+/// 上一帧的旧图形不会被覆盖，拖动矩形/椭圆时就会拖出一片残影。
+#[test]
+fn shape_preview_does_not_leave_ghosts_between_frames() {
+    use link_ink::input::InputEvent;
+
+    let mut app = link_ink::app::App::new(document());
+    app.settings.tool = link_ink::app::Tool::Rect;
+    app.settings.color = Rgba::BLACK;
+    let view = view();
+
+    let mut cache = OverlayCache::new(&monitor(), 2.0);
+    let mut surface = target();
+    {
+        let cr = Context::new(&surface).expect("ctx");
+        cr.set_operator(cairo::Operator::Source);
+        cr.set_source_rgba(0.0, 0.0, 0.0, 0.0);
+        cr.paint().expect("clear");
+    }
+
+    // 第一帧：从 (10,10) 拖到 (40,25) —— 一个横向大矩形
+    app.handle_input(InputEvent::Down(pen(10.0, 10.0)), &view);
+    app.handle_input(InputEvent::Move(pen(40.0, 25.0)), &view);
+    let damage_first = app.draft_damage_pt().expect("第一帧应有脏矩形");
+    {
+        let cr = Context::new(&surface).expect("ctx");
+        link_ink::ui::overlay::draw(
+            &cr,
+            &app,
+            &view,
+            &mut cache,
+            Some(damage(damage_first, &view)),
+        );
+    }
+    // 第一帧矩形右上角附近应该有墨
+    assert!(
+        is_dark(read_pixel(&mut surface, 78, 30)),
+        "第一帧应画出矩形"
+    );
+
+    // 第二帧：缩回到 (12,12)-(20,18)，第一帧那片区域必须被擦掉
+    app.handle_input(InputEvent::Move(pen(20.0, 18.0)), &view);
+    let damage_second = app.draft_damage_pt().expect("第二帧应有脏矩形");
+    // 按真实链路那样取两帧的并集（GTK 会把多个事件合并成一次绘制）
+    let union = (
+        damage_first.0.min(damage_second.0),
+        damage_first.1.min(damage_second.1),
+        damage_first.2.max(damage_second.2),
+        damage_first.3.max(damage_second.3),
+    );
+    {
+        let cr = Context::new(&surface).expect("ctx");
+        link_ink::ui::overlay::draw(&cr, &app, &view, &mut cache, Some(damage(union, &view)));
+    }
+
+    let ghost = read_pixel(&mut surface, 78, 30);
+    assert!(
+        !is_dark(ghost),
+        "第一帧的矩形应当被擦除，实际残留像素 {ghost:?}（残影）"
+    );
+}
+
+fn is_dark(pixel: [u8; 4]) -> bool {
+    pixel[3] > 128 && pixel[0] < 90 && pixel[1] < 90 && pixel[2] < 90
+}
+
+/// 页面坐标 → 逻辑坐标（overlay::draw 的 damage 参数用逻辑坐标）。
+fn damage(page: (f64, f64, f64, f64), view: &ViewTransform) -> (f64, f64, f64, f64) {
+    let a = view.page_to_logical(Point::new(page.0, page.1));
+    let b = view.page_to_logical(Point::new(page.2, page.3));
+    (a.0.min(b.0), a.1.min(b.1), a.0.max(b.0), a.1.max(b.1))
+}

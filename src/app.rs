@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::input::{pressure_width, InputEvent, PointerSample, ToolKind};
 use crate::model::{Document, Point, Rgba, Stroke};
+use crate::undo::{Edit, UndoResult, UndoStack};
 use crate::view::ViewTransform;
 
 const MIN_SAMPLE_DISTANCE_LOGICAL: f64 = 0.5;
@@ -103,6 +104,8 @@ pub struct App {
     gesture: Gesture,
     dirty: bool,
     project_path: Option<PathBuf>,
+    /// 可撤回操作的栈（最多 50 步）。打开工程或换文档时清空。
+    undo: UndoStack,
 }
 
 impl App {
@@ -115,6 +118,7 @@ impl App {
             gesture: Gesture::Idle,
             dirty: false,
             project_path: None,
+            undo: UndoStack::new(),
         }
     }
 
@@ -147,6 +151,13 @@ impl App {
         self.gesture = Gesture::Idle;
         self.dirty = false;
         self.project_path = project_path;
+        // 换文档后旧的撤回记录指向的笔迹已经不存在了。
+        self.undo.clear();
+    }
+
+    /// 可撤回的操作数。
+    pub fn undo_depth(&self) -> usize {
+        self.undo.len()
     }
 
     pub fn is_drawing(&self) -> bool {
@@ -180,13 +191,7 @@ impl App {
 
         if sample.tool == ToolKind::Eraser || self.settings.tool == Tool::Eraser {
             self.gesture = Gesture::Erasing { last: point };
-            let removed = self
-                .document
-                .erase_segment_active(point, point, ERASE_TOLERANCE_PT);
-            if removed > 0 {
-                self.dirty = true;
-            }
-            return removed > 0;
+            return self.erase_at(point, point);
         }
 
         if self.settings.tool.is_shape() {
@@ -246,13 +251,7 @@ impl App {
                 }
                 let from = *last;
                 *last = point;
-                let removed = self
-                    .document
-                    .erase_segment_active(from, point, ERASE_TOLERANCE_PT);
-                if removed > 0 {
-                    self.dirty = true;
-                }
-                removed > 0
+                self.erase_at(from, point)
             }
             Gesture::Shape(draft) => {
                 let point = view.logical_to_page(sample.logical.0, sample.logical.1);
@@ -326,16 +325,14 @@ impl App {
                 } else {
                     Stroke::constant(self.settings.color, self.settings.width_pt, points)
                 };
-                self.document.active_layer_mut().strokes.push(stroke);
-                self.dirty = true;
+                self.push_stroke(stroke);
                 true
             }
             Gesture::Shape(draft) => {
                 let Some(stroke) = build_shape_stroke(&self.settings, &draft) else {
                     return false;
                 };
-                self.document.active_layer_mut().strokes.push(stroke);
-                self.dirty = true;
+                self.push_stroke(stroke);
                 true
             }
             Gesture::Erasing { .. } | Gesture::Idle => false,
@@ -422,13 +419,68 @@ impl App {
     }
 
     pub fn clear_active_layer(&mut self) -> bool {
-        let layer = self.document.active_layer_mut();
-        if layer.strokes.is_empty() {
+        let layer_index = self.document.active;
+        if self.document.layers[layer_index].strokes.is_empty() {
             return false;
         }
-        layer.strokes.clear();
+        let layer_id = self.document.layers[layer_index].id;
+        let removed: Vec<(usize, Stroke)> =
+            std::mem::take(&mut self.document.layers[layer_index].strokes)
+                .into_iter()
+                .enumerate()
+                .collect();
+        self.dirty = true;
+        self.undo.record(Edit::Removed {
+            layer: layer_id,
+            strokes: removed,
+        });
+        true
+    }
+
+    /// 把一笔加到当前图层，并记入撤回栈。
+    fn push_stroke(&mut self, stroke: Stroke) {
+        let layer_index = self.document.active;
+        let layer_id = self.document.layers[layer_index].id;
+        let index = self.document.layers[layer_index].strokes.len();
+        self.document.layers[layer_index]
+            .strokes
+            .push(stroke.clone());
+        self.dirty = true;
+        self.undo.record(Edit::Added {
+            layer: layer_id,
+            stroke,
+            index,
+        });
+    }
+
+    /// 擦除一段并记入撤回栈，返回是否擦掉了东西。
+    fn erase_at(&mut self, from: Point, to: Point) -> bool {
+        let layer_id = self.document.active_layer().id;
+        let removed = self
+            .document
+            .erase_segment_active_recorded(from, to, ERASE_TOLERANCE_PT);
+        if removed.is_empty() {
+            return false;
+        }
+        self.undo.record(Edit::Removed {
+            layer: layer_id,
+            strokes: removed,
+        });
         self.dirty = true;
         true
+    }
+
+    /// 撤回一步（Ctrl+Z）。返回被改动的图层索引，`None` 表示没有可撤回的内容。
+    ///
+    /// 画到一半时按 Ctrl+Z 只丢弃当前草稿、不撤上一笔，避免"手滑撤掉整笔"。
+    pub fn undo(&mut self) -> Option<UndoResult> {
+        if self.is_drawing() {
+            self.gesture = Gesture::Idle;
+            return None;
+        }
+        let result = self.undo.undo(&mut self.document)?;
+        self.dirty = true;
+        Some(result)
     }
 
     /// 本事件的压感值：缺少压感轴时沿用上一次读数，避免宽度突然跳到满宽。

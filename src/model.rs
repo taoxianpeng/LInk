@@ -118,6 +118,24 @@ impl Stroke {
         }
     }
 
+    /// 笔迹的页面坐标包围盒 `(x0, y0, x1, y1)`，已把线宽算进去。
+    ///
+    /// 用于"只重画某一小片区域"的裁剪判断：包围盒不相交的笔迹可以直接跳过。
+    pub fn bounds_pt(&self) -> (f64, f64, f64, f64) {
+        let margin = self.max_width() / 2.0 + 1.0;
+        let Some(first) = self.points.first() else {
+            return (0.0, 0.0, 0.0, 0.0);
+        };
+        let (mut x0, mut y0, mut x1, mut y1) = (first.x, first.y, first.x, first.y);
+        for point in &self.points[1..] {
+            x0 = x0.min(point.x);
+            y0 = y0.min(point.y);
+            x1 = x1.max(point.x);
+            y1 = y1.max(point.y);
+        }
+        (x0 - margin, y0 - margin, x1 + margin, y1 + margin)
+    }
+
     pub fn max_width(&self) -> f64 {
         self.widths_pt
             .as_ref()
@@ -126,22 +144,38 @@ impl Stroke {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct Layer {
+    /// 稳定的图层标识。撤回记录用它定位图层，这样增删/移动图层后索引错位也不会撤错层。
+    /// 不参与相等比较，也不写入 xopp（每次加载重新分配）。
+    pub id: u64,
     pub name: String,
     pub strokes: Vec<Stroke>,
     /// 是否显示。仅影响屏幕渲染与导出，不写入 xopp（Xournal++ 没有图层可见性）。
     pub visible: bool,
 }
 
+impl PartialEq for Layer {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.strokes == other.strokes && self.visible == other.visible
+    }
+}
+
 impl Layer {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
+            id: next_layer_id(),
             name: name.into(),
             strokes: Vec::new(),
             visible: true,
         }
     }
+}
+
+fn next_layer_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -170,6 +204,11 @@ impl Document {
             layers: vec![Layer::new("图层 1")],
             active: 0,
         }
+    }
+
+    /// 按稳定 id 找图层，返回其索引。
+    pub fn layer_index_by_id(&self, id: u64) -> Option<usize> {
+        self.layers.iter().position(|layer| layer.id == id)
     }
 
     pub fn active_layer(&self) -> &Layer {
@@ -250,12 +289,30 @@ impl Document {
     }
 
     pub fn erase_segment_active(&mut self, from: Point, to: Point, tolerance_pt: f64) -> usize {
+        self.erase_segment_active_recorded(from, to, tolerance_pt)
+            .len()
+    }
+
+    /// 同 [`Self::erase_segment_active`]，但把被删掉的笔迹连同原始位置一起返回，
+    /// 供撤回栈恢复。
+    pub fn erase_segment_active_recorded(
+        &mut self,
+        from: Point,
+        to: Point,
+        tolerance_pt: f64,
+    ) -> Vec<(usize, Stroke)> {
         let layer = &mut self.layers[self.active];
-        let before = layer.strokes.len();
-        layer
-            .strokes
-            .retain(|stroke| !stroke_hits_segment(stroke, from, to, tolerance_pt));
-        before - layer.strokes.len()
+        let mut removed = Vec::new();
+        let mut kept = Vec::with_capacity(layer.strokes.len());
+        for (index, stroke) in std::mem::take(&mut layer.strokes).into_iter().enumerate() {
+            if stroke_hits_segment(&stroke, from, to, tolerance_pt) {
+                removed.push((index, stroke));
+            } else {
+                kept.push(stroke);
+            }
+        }
+        layer.strokes = kept;
+        removed
     }
 }
 

@@ -152,8 +152,12 @@ impl CanvasApp {
         match command {
             Command::Hello { proto } => {
                 if proto != PROTOCOL_VERSION {
+                    // 面板与画布是两个可执行文件，很容易一新一旧（cargo run 只重建面板）。
                     return vec![Event::Error {
-                        message: format!("协议版本不一致：面板 {proto}，画布 {PROTOCOL_VERSION}"),
+                        message: format!(
+                            "画布与面板版本不一致（面板 {proto}，画布 {PROTOCOL_VERSION}）：\
+                             请执行 `cargo build --workspace` 重新构建后再启动"
+                        ),
                     }];
                 }
                 vec![self.ready_event(), self.state_event(true)]
@@ -221,6 +225,26 @@ impl CanvasApp {
                     Vec::new()
                 }
             }
+            Command::Undo => match self.app.undo() {
+                Some(result) => {
+                    // 撤回可能恢复一大片被擦掉的笔迹，直接整屏重绘最省心。
+                    self.mark_dirty_and_redraw();
+                    log::debug!(
+                        "撤回：图层 {}，{}",
+                        result.layer,
+                        if result.restored {
+                            "恢复被删笔迹"
+                        } else {
+                            "删除最近一笔"
+                        }
+                    );
+                    vec![self.state_event(true)]
+                }
+                None => {
+                    log::debug!("撤回：没有可撤回的内容");
+                    Vec::new()
+                }
+            },
             Command::ClearLayer => {
                 if self.app.clear_active_layer() {
                     self.redraw = true;
