@@ -25,6 +25,23 @@ pub enum Glyph {
     Trash,
     Close,
     Gear,
+    SelectRect,
+    SelectLasso,
+}
+
+fn dashed_segment(painter: &Painter, from: Pos2, to: Pos2, stroke: Stroke, dash: f32, gap: f32) {
+    let delta = to - from;
+    let length = delta.length();
+    if length <= 0.0 {
+        return;
+    }
+    let direction = delta / length;
+    let mut offset = 0.0;
+    while offset < length {
+        let end = (offset + dash).min(length);
+        painter.line_segment([from + direction * offset, from + direction * end], stroke);
+        offset += dash + gap;
+    }
 }
 
 /// 绕 `center` 旋转 `angle` 弧度。
@@ -330,6 +347,56 @@ pub fn paint(painter: &Painter, rect: Rect, glyph: Glyph, color: Color32) {
                         Pos2::new(c.x + cos * 0.78 * s, c.y + sin * 0.78 * s),
                     ],
                     Stroke::new(stroke.width * 1.1, color),
+                );
+            }
+        }
+        Glyph::SelectRect => {
+            let rect = Rect::from_center_size(c, Vec2::new(size * 0.86, size * 0.66));
+            let corners = [
+                rect.left_top(),
+                rect.right_top(),
+                rect.right_bottom(),
+                rect.left_bottom(),
+            ];
+            for index in 0..4 {
+                dashed_segment(
+                    painter,
+                    corners[index],
+                    corners[(index + 1) % 4],
+                    stroke,
+                    size * 0.20,
+                    size * 0.13,
+                );
+            }
+        }
+        Glyph::SelectLasso => {
+            // 手绘套索形状：明显不规则的闭合区域，用虚线描边。
+            const SHAPE: [(f32, f32); 12] = [
+                (-0.84, -0.22),
+                (-0.62, -0.74),
+                (-0.16, -0.58),
+                (0.14, -0.84),
+                (0.62, -0.52),
+                (0.84, -0.02),
+                (0.52, 0.26),
+                (0.70, 0.70),
+                (0.20, 0.76),
+                (-0.04, 0.48),
+                (-0.48, 0.74),
+                (-0.82, 0.34),
+            ];
+            let points: Vec<Pos2> = SHAPE
+                .iter()
+                .map(|(x, y)| Pos2::new(c.x + x * s, c.y + y * s))
+                .collect();
+            for index in 0..points.len() {
+                dashed_segment(
+                    painter,
+                    points[index],
+                    points[(index + 1) % points.len()],
+                    stroke,
+                    size * 0.15,
+                    size * 0.10,
                 );
             }
         }

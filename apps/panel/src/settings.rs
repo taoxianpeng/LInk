@@ -144,11 +144,12 @@ mod tests {
     fn roundtrip_preserves_values() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("link-ink/settings.json");
-        let mut settings = Settings::default();
-        settings.width_presets = [0.8, 2.4, 6.0];
-        settings.set_preset(2);
-        settings.gamma = 1.6;
-        settings.min_ratio = 0.4;
+        let settings = Settings {
+            width_presets: [0.8, 2.4, 6.0],
+            width_preset: 2,
+            gamma: 1.6,
+            min_ratio: 0.4,
+        };
 
         settings.save_to(&path).unwrap();
         let loaded = Settings::load_from(&path);

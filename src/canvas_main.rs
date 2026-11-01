@@ -165,15 +165,27 @@ fn build_canvas(app: &gtk::Application) -> Result<(), PlatformError> {
             // 最新一小段笔迹这一帧不会被重绘（表现为笔尖掉队/闪烁）。
             let events = canvas.on_input(event);
             let needs_redraw = canvas.take_redraw();
-            let erasing = canvas.app().is_erasing();
-            let damage = canvas.app().draft_damage_pt();
+            let force_full = canvas.app_mut().take_force_full_redraw();
+            let full_redraw = force_full || canvas.app().is_erasing();
+            let damage = if force_full {
+                None
+            } else {
+                canvas.app().interaction_damage_pt()
+            };
             let view = canvas.view();
             drop(canvas);
 
             emit(events);
-            if needs_redraw {
+            if needs_redraw || force_full {
                 if let Some(area) = area_slot.borrow().as_ref() {
-                    queue_damage(area, &view, damage, erasing, &last_damage, &pending_draw);
+                    queue_damage(
+                        area,
+                        &view,
+                        damage,
+                        full_redraw,
+                        &last_damage,
+                        &pending_draw,
+                    );
                 }
             }
         })
@@ -274,6 +286,8 @@ fn build_canvas(app: &gtk::Application) -> Result<(), PlatformError> {
                     .borrow_mut()
                     .handle_command(command, &mut *host.borrow_mut());
                 let needs_redraw = canvas.borrow_mut().take_redraw();
+                // 命令路径本身就整屏重绘，清掉输入路径的一次性标志。
+                let _ = canvas.borrow_mut().app_mut().take_force_full_redraw();
                 emit(events);
                 if needs_redraw {
                     last_damage.set(None);
@@ -385,7 +399,7 @@ fn queue_damage(
     area: &gtk::DrawingArea,
     view: &ViewTransform,
     damage_page: Option<DamageRect>,
-    erasing: bool,
+    full_redraw: bool,
     last_damage: &Rc<Cell<Option<DamageRect>>>,
     pending_draw: &Rc<Cell<Option<DrawScope>>>,
 ) {
@@ -395,7 +409,7 @@ fn queue_damage(
         (ax.min(bx), ay.min(by), ax.max(bx), ay.max(by))
     });
     let previous = last_damage.replace(current);
-    if erasing {
+    if full_redraw {
         pending_draw.set(Some(DrawScope::Full));
         area.queue_draw();
         return;

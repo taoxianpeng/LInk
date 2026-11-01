@@ -6,6 +6,7 @@ pub mod input;
 pub mod model;
 pub mod platform;
 pub mod render;
+pub mod selection;
 pub mod ui;
 pub mod undo;
 pub mod view;

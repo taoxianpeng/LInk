@@ -26,6 +26,18 @@ pub enum Edit {
         layer: u64,
         strokes: Vec<(usize, Stroke)>,
     },
+    /// 原地修改或跨层移动：撤回时把 after 换成 before。
+    Modified { changes: Vec<StrokeChange> },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StrokeChange {
+    pub before_layer: u64,
+    pub before_index: usize,
+    pub before: Stroke,
+    pub after_layer: u64,
+    pub after_index: usize,
+    pub after: Stroke,
 }
 
 /// 一次撤回实际影响到的图层索引，用于决定重绘范围。
@@ -63,6 +75,11 @@ impl UndoStack {
         if let Edit::Removed { strokes, .. } = &edit {
             // 什么都没删掉的操作不值得占用历史。
             if strokes.is_empty() {
+                return;
+            }
+        }
+        if let Edit::Modified { changes } = &edit {
+            if changes.is_empty() {
                 return;
             }
         }
@@ -117,6 +134,43 @@ impl UndoStack {
                         layer: layer_index,
                         restored: true,
                     });
+                }
+                Edit::Modified { changes } => {
+                    let mut touched = None;
+                    // 倒序处理：先撤后面的改动，前面记录的索引仍然有效。
+                    for change in changes.iter().rev() {
+                        let Some(after_layer) = document.layer_index_by_id(change.after_layer)
+                        else {
+                            continue;
+                        };
+                        let strokes = &mut document.layers[after_layer].strokes;
+                        let position = if strokes.get(change.after_index) == Some(&change.after) {
+                            Some(change.after_index)
+                        } else {
+                            strokes
+                                .iter()
+                                .rposition(|candidate| candidate == &change.after)
+                        };
+                        let Some(position) = position else {
+                            continue;
+                        };
+                        strokes.remove(position);
+
+                        let Some(before_layer) = document.layer_index_by_id(change.before_layer)
+                        else {
+                            continue;
+                        };
+                        let target = &mut document.layers[before_layer].strokes;
+                        let position = change.before_index.min(target.len());
+                        target.insert(position, change.before.clone());
+                        touched = Some(before_layer);
+                    }
+                    if let Some(layer) = touched {
+                        return Some(UndoResult {
+                            layer,
+                            restored: true,
+                        });
+                    }
                 }
             }
         }
@@ -223,5 +277,53 @@ mod tests {
             strokes: Vec::new(),
         });
         assert!(stack.is_empty());
+    }
+
+    #[test]
+    fn modified_stroke_is_restored_in_place() {
+        let before = stroke_at(0.0);
+        let after = stroke_at(50.0);
+        let mut document = document_with(vec![after.clone(), stroke_at(100.0)]);
+        let layer = document.layers[0].id;
+        let mut stack = UndoStack::new();
+        stack.record(Edit::Modified {
+            changes: vec![StrokeChange {
+                before_layer: layer,
+                before_index: 0,
+                before: before.clone(),
+                after_layer: layer,
+                after_index: 0,
+                after,
+            }],
+        });
+
+        assert!(stack.undo(&mut document).is_some());
+        assert_eq!(document.layers[0].strokes, vec![before, stroke_at(100.0)]);
+    }
+
+    #[test]
+    fn modified_stroke_can_move_between_layers_and_back() {
+        let original = stroke_at(0.0);
+        let mut document = Document::new(800.0, 600.0);
+        document.add_layer_above_active();
+        let source = document.layers[0].id;
+        let target = document.layers[1].id;
+        document.layers[1].strokes.push(original.clone());
+
+        let mut stack = UndoStack::new();
+        stack.record(Edit::Modified {
+            changes: vec![StrokeChange {
+                before_layer: source,
+                before_index: 0,
+                before: original.clone(),
+                after_layer: target,
+                after_index: 0,
+                after: original,
+            }],
+        });
+
+        assert!(stack.undo(&mut document).is_some());
+        assert_eq!(document.layers[1].strokes.len(), 0);
+        assert_eq!(document.layers[0].strokes, vec![stroke_at(0.0)]);
     }
 }

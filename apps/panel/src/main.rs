@@ -51,6 +51,10 @@ enum Action {
     RenameLayer(usize, String),
     ToggleLayer(usize, bool),
     ClearLayer,
+    RecolorSelection([u8; 4]),
+    ScaleSelection(f64),
+    MoveSelectionToLayer(usize),
+    ClearSelection,
     Undo,
     Passthrough(bool),
     Open,
@@ -90,6 +94,8 @@ struct PanelApp {
 
     tool: ToolDto,
     color: [u8; 4],
+    selection_count: usize,
+    selection_color: [u8; 4],
     settings: Settings,
     show_settings: bool,
     settings_dirty: bool,
@@ -132,6 +138,8 @@ impl PanelApp {
             passthrough: false,
             tool: ToolDto::Pen,
             color: [0x1C, 0x1C, 0x22, 0xFF],
+            selection_count: 0,
+            selection_color: [0xDC, 0x26, 0x26, 0xFF],
             settings,
             show_settings: false,
             settings_dirty: false,
@@ -194,6 +202,16 @@ impl PanelApp {
                 self.send(Command::LayerVisibility { index, visible })
             }
             Action::ClearLayer => self.send(Command::ClearLayer),
+            Action::RecolorSelection(rgba) => {
+                self.send(Command::RecolorSelection { rgba });
+            }
+            Action::ScaleSelection(factor) => {
+                self.send(Command::ScaleSelection { factor });
+            }
+            Action::MoveSelectionToLayer(index) => {
+                self.send(Command::MoveSelectionToLayer { index });
+            }
+            Action::ClearSelection => self.send(Command::ClearSelection),
             Action::Undo => self.send(Command::Undo),
             Action::Passthrough(enabled) => self.send(Command::SetPassthrough { enabled }),
             Action::Open => self.start_pick(ctx, PickKind::OpenXopp),
@@ -315,9 +333,11 @@ impl PanelApp {
                     layers,
                     active,
                     passthrough,
+                    selection,
                 } => {
                     self.passthrough = passthrough;
                     self.active = active;
+                    self.selection_count = selection;
                     self.merge_layers(ctx, layers);
                 }
                 Event::Device {
@@ -541,6 +561,7 @@ impl eframe::App for PanelApp {
                 self.tools_row(ui, &mut actions);
                 self.colors_row(ui, &mut actions);
                 self.width_row(ui, &mut actions);
+                self.selection_row(ui, &mut actions);
                 separator(ui);
                 self.layers_section(ui, &mut actions);
                 content_bottom = self.footer(ui, &mut actions);
@@ -669,6 +690,8 @@ impl PanelApp {
                 (Glyph::Line, ToolDto::Line, "直线 (L)"),
                 (Glyph::Rect, ToolDto::Rect, "矩形 (R)"),
                 (Glyph::Ellipse, ToolDto::Ellipse, "椭圆 (O)"),
+                (Glyph::SelectRect, ToolDto::SelectRect, "矩形选择 (S)"),
+                (Glyph::SelectLasso, ToolDto::SelectLasso, "自由选择 (F)"),
             ];
             for (glyph, tool, hint) in tools {
                 if icon_button(ui, glyph, Vec2::splat(TOOL_BUTTON), self.tool == tool, hint) {
@@ -763,6 +786,63 @@ impl PanelApp {
                         .color(DIM),
                 );
             });
+        });
+    }
+
+    fn selection_row(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        if self.selection_count == 0 {
+            return;
+        }
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!("已选 {}", self.selection_count))
+                    .font(small())
+                    .color(ACCENT),
+            );
+            ui.spacing_mut().item_spacing.x = 4.0;
+            if icon_button(ui, Glyph::Minus, Vec2::splat(ACTION_BUTTON), false, "缩小") {
+                actions.push(Action::ScaleSelection(1.0 / 1.1));
+            }
+            if icon_button(ui, Glyph::Plus, Vec2::splat(ACTION_BUTTON), false, "放大") {
+                actions.push(Action::ScaleSelection(1.1));
+            }
+            let mut color = Color32::from_rgba_unmultiplied(
+                self.selection_color[0],
+                self.selection_color[1],
+                self.selection_color[2],
+                self.selection_color[3],
+            );
+            if ui
+                .color_edit_button_srgba(&mut color)
+                .on_hover_text("选区颜色")
+                .changed()
+            {
+                self.selection_color = [color.r(), color.g(), color.b(), color.a()];
+                actions.push(Action::RecolorSelection(self.selection_color));
+            }
+            let mut target = None;
+            egui::ComboBox::from_id_salt("selection_layer")
+                .selected_text(RichText::new("→ 图层").font(small()))
+                .width(72.0)
+                .show_ui(ui, |ui| {
+                    for (index, layer) in self.layers.iter().enumerate() {
+                        if ui.selectable_label(false, &layer.name).clicked() {
+                            target = Some(index);
+                        }
+                    }
+                });
+            if let Some(index) = target {
+                actions.push(Action::MoveSelectionToLayer(index));
+            }
+            if icon_button(
+                ui,
+                Glyph::Close,
+                Vec2::splat(ACTION_BUTTON),
+                false,
+                "清除选择",
+            ) {
+                actions.push(Action::ClearSelection);
+            }
         });
     }
 
@@ -1212,20 +1292,25 @@ impl PanelApp {
         if ctx.egui_wants_keyboard_input() {
             return;
         }
-        let (p, e, l, r, o, f8, ctrl_s, ctrl_o, ctrl_e, ctrl_z) = ctx.input(|input| {
-            (
-                input.key_pressed(egui::Key::P),
-                input.key_pressed(egui::Key::E),
-                input.key_pressed(egui::Key::L),
-                input.key_pressed(egui::Key::R),
-                input.key_pressed(egui::Key::O),
-                input.key_pressed(egui::Key::F8),
-                input.modifiers.command && input.key_pressed(egui::Key::S),
-                input.modifiers.command && input.key_pressed(egui::Key::O),
-                input.modifiers.command && input.key_pressed(egui::Key::E),
-                input.modifiers.command && input.key_pressed(egui::Key::Z),
-            )
-        });
+        let (p, e, l, r, o, s, f, escape, f8, ctrl_s, ctrl_o, ctrl_e, ctrl_z) =
+            ctx.input(|input| {
+                let command = input.modifiers.command;
+                (
+                    input.key_pressed(egui::Key::P),
+                    input.key_pressed(egui::Key::E),
+                    input.key_pressed(egui::Key::L),
+                    input.key_pressed(egui::Key::R),
+                    input.key_pressed(egui::Key::O),
+                    !command && input.key_pressed(egui::Key::S),
+                    !command && input.key_pressed(egui::Key::F),
+                    input.key_pressed(egui::Key::Escape),
+                    input.key_pressed(egui::Key::F8),
+                    command && input.key_pressed(egui::Key::S),
+                    command && input.key_pressed(egui::Key::O),
+                    command && input.key_pressed(egui::Key::E),
+                    command && input.key_pressed(egui::Key::Z),
+                )
+            });
         if ctrl_z {
             self.dispatch(ctx, Action::Undo);
         }
@@ -1255,6 +1340,15 @@ impl PanelApp {
         }
         if o {
             self.dispatch(ctx, Action::SetTool(ToolDto::Ellipse));
+        }
+        if s {
+            self.dispatch(ctx, Action::SetTool(ToolDto::SelectRect));
+        }
+        if f {
+            self.dispatch(ctx, Action::SetTool(ToolDto::SelectLasso));
+        }
+        if escape && self.selection_count > 0 {
+            self.dispatch(ctx, Action::ClearSelection);
         }
     }
 }

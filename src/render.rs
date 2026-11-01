@@ -3,7 +3,11 @@ use std::f64::consts::PI;
 use cairo::{Context, LineCap, LineJoin};
 
 use crate::model::{Document, Layer, Point, Stroke};
+use crate::selection::{MarqueeKind, Rect, SelectionTransform};
 use crate::view::ViewTransform;
+
+const SELECTION_COLOR: (f64, f64, f64, f64) = (0.31765, 0.27843, 0.89804, 1.0);
+const SELECTION_HALO: (f64, f64, f64, f64) = (1.0, 1.0, 1.0, 0.92);
 
 const CAP_SEGMENTS: usize = 10;
 /// 平滑插值的最大步长（页面 pt）。约等于 2 个逻辑像素，足够消除折痕。
@@ -89,6 +93,186 @@ pub fn draw_layer(cr: &Context, layer: &Layer, view: &ViewTransform) -> cairo::R
     cr.restore()
 }
 
+pub fn draw_selection(
+    cr: &Context,
+    strokes: &[&Stroke],
+    view: &ViewTransform,
+    transform: SelectionTransform,
+) -> cairo::Result<()> {
+    cr.save()?;
+    apply_transform(cr, view)?;
+    apply_selection_transform(cr, transform);
+    let scale = view.pt_to_logical().max(1e-6);
+    cr.set_dash(&[5.0 / scale, 4.0 / scale], 0.0);
+    cr.set_line_cap(LineCap::Round);
+    cr.set_line_join(LineJoin::Round);
+    for stroke in strokes {
+        if !build_selection_edge_path(cr, stroke) {
+            continue;
+        }
+        cr.set_source_rgba(SELECTION_HALO.0, SELECTION_HALO.1, SELECTION_HALO.2, 0.85);
+        cr.set_line_width(2.4 / scale);
+        cr.stroke_preserve()?;
+        cr.set_source_rgba(
+            SELECTION_COLOR.0,
+            SELECTION_COLOR.1,
+            SELECTION_COLOR.2,
+            0.95,
+        );
+        cr.set_line_width(1.3 / scale);
+        cr.stroke()?;
+    }
+    cr.set_dash(&[], 0.0);
+    cr.restore()
+}
+
+pub fn draw_selection_box(
+    cr: &Context,
+    bounds: Rect,
+    transform: SelectionTransform,
+    view: &ViewTransform,
+) -> cairo::Result<()> {
+    cr.save()?;
+    apply_transform(cr, view)?;
+    apply_selection_transform(cr, transform);
+    let scale = view.pt_to_logical().max(1e-6);
+    let corners = [
+        Point::new(bounds.0, bounds.1),
+        Point::new(bounds.2, bounds.1),
+        Point::new(bounds.2, bounds.3),
+        Point::new(bounds.0, bounds.3),
+    ];
+    cr.set_source_rgba(
+        SELECTION_COLOR.0,
+        SELECTION_COLOR.1,
+        SELECTION_COLOR.2,
+        0.95,
+    );
+    cr.set_line_width(1.0 / scale);
+    cr.new_path();
+    cr.move_to(corners[0].x, corners[0].y);
+    for point in &corners[1..] {
+        cr.line_to(point.x, point.y);
+    }
+    cr.close_path();
+    cr.stroke()?;
+
+    let half = 3.0 / scale;
+    let mut handles = Vec::with_capacity(8);
+    handles.extend_from_slice(&corners);
+    for index in 0..4 {
+        let a = corners[index];
+        let b = corners[(index + 1) % 4];
+        handles.push(Point::new((a.x + b.x) / 2.0, (a.y + b.y) / 2.0));
+    }
+    for point in handles {
+        cr.rectangle(point.x - half, point.y - half, half * 2.0, half * 2.0);
+        cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
+        cr.fill_preserve()?;
+        cr.set_source_rgba(SELECTION_COLOR.0, SELECTION_COLOR.1, SELECTION_COLOR.2, 1.0);
+        cr.set_line_width(1.0 / scale);
+        cr.stroke()?;
+    }
+    cr.restore()
+}
+
+fn apply_selection_transform(cr: &Context, transform: SelectionTransform) {
+    match transform {
+        SelectionTransform::None => {}
+        SelectionTransform::Move { dx, dy } => cr.translate(dx, dy),
+        SelectionTransform::Scale { center, factor } => {
+            cr.translate(center.x, center.y);
+            cr.scale(factor, factor);
+            cr.translate(-center.x, -center.y);
+        }
+        SelectionTransform::Rotate { center, radians } => {
+            cr.translate(center.x, center.y);
+            cr.rotate(radians);
+            cr.translate(-center.x, -center.y);
+        }
+    }
+}
+
+fn build_selection_edge_path(cr: &Context, stroke: &Stroke) -> bool {
+    match stroke.points.as_slice() {
+        [] => false,
+        [point] => {
+            cr.new_sub_path();
+            cr.arc(
+                point.x,
+                point.y,
+                stroke.width_at(0).max(0.05) / 2.0 + 0.5,
+                0.0,
+                2.0 * PI,
+            );
+            true
+        }
+        _ => {
+            if stroke.widths_pt.is_some() {
+                let widths: Vec<f64> = (0..stroke.points.len())
+                    .map(|index| stroke.width_at(index))
+                    .collect();
+                let (points, widths) = smooth_polyline(&stroke.points, &widths);
+                build_outline_path(cr, &points, &widths, 0.5);
+            } else {
+                let widths = vec![stroke.base_width_pt.max(0.05); stroke.points.len()];
+                build_outline_path(cr, &stroke.points, &widths, 0.5);
+            }
+            true
+        }
+    }
+}
+
+pub fn draw_marquee(
+    cr: &Context,
+    kind: MarqueeKind,
+    start: Point,
+    current: Point,
+    points: &[Point],
+    view: &ViewTransform,
+) -> cairo::Result<()> {
+    cr.save()?;
+    apply_transform(cr, view)?;
+    let logical_to_page = view.pt_to_logical().max(1e-6);
+    let dash = 5.0 / logical_to_page;
+    let gap = 4.0 / logical_to_page;
+    cr.set_dash(&[dash, gap], 0.0);
+    cr.set_line_width(1.5 / logical_to_page);
+    match kind {
+        MarqueeKind::Rect => {
+            let (x0, y0) = (start.x.min(current.x), start.y.min(current.y));
+            let (x1, y1) = (start.x.max(current.x), start.y.max(current.y));
+            cr.rectangle(x0, y0, x1 - x0, y1 - y0);
+        }
+        MarqueeKind::Lasso => {
+            if let Some(first) = points.first() {
+                cr.move_to(first.x, first.y);
+                for point in &points[1..] {
+                    cr.line_to(point.x, point.y);
+                }
+                cr.line_to(current.x, current.y);
+                cr.close_path();
+            }
+        }
+    }
+    cr.set_source_rgba(
+        SELECTION_COLOR.0,
+        SELECTION_COLOR.1,
+        SELECTION_COLOR.2,
+        0.10,
+    );
+    cr.fill_preserve()?;
+    cr.set_source_rgba(
+        SELECTION_COLOR.0,
+        SELECTION_COLOR.1,
+        SELECTION_COLOR.2,
+        0.95,
+    );
+    cr.stroke()?;
+    cr.set_dash(&[], 0.0);
+    cr.restore()
+}
+
 pub fn draw_layer_thumbnail(
     cr: &Context,
     layer: &Layer,
@@ -125,19 +309,22 @@ fn paint_stroke(cr: &Context, stroke: &Stroke) -> cairo::Result<()> {
         color.b as f64 / 255.0,
         color.a as f64 / 255.0,
     );
+    paint_stroke_extra(cr, stroke, 0.0)
+}
 
+fn paint_stroke_extra(cr: &Context, stroke: &Stroke, extra: f64) -> cairo::Result<()> {
     match &stroke.widths_pt {
-        None => paint_constant_stroke(cr, stroke),
-        Some(_) => paint_variable_stroke(cr, stroke),
+        None => paint_constant_stroke(cr, stroke, extra),
+        Some(_) => paint_variable_stroke(cr, stroke, extra),
     }
 }
 
-fn paint_constant_stroke(cr: &Context, stroke: &Stroke) -> cairo::Result<()> {
+fn paint_constant_stroke(cr: &Context, stroke: &Stroke, extra: f64) -> cairo::Result<()> {
     let width = stroke.base_width_pt.max(0.05);
     if stroke.points.len() == 1 {
         let point = stroke.points[0];
         cr.new_sub_path();
-        cr.arc(point.x, point.y, width / 2.0, 0.0, 2.0 * PI);
+        cr.arc(point.x, point.y, width / 2.0 + extra, 0.0, 2.0 * PI);
         return cr.fill();
     }
     cr.new_path();
@@ -145,18 +332,18 @@ fn paint_constant_stroke(cr: &Context, stroke: &Stroke) -> cairo::Result<()> {
     for point in &stroke.points[1..] {
         cr.line_to(point.x, point.y);
     }
-    cr.set_line_width(width);
+    cr.set_line_width(width + 2.0 * extra);
     cr.stroke()
 }
 
-fn paint_variable_stroke(cr: &Context, stroke: &Stroke) -> cairo::Result<()> {
+fn paint_variable_stroke(cr: &Context, stroke: &Stroke, extra: f64) -> cairo::Result<()> {
     if stroke.points.len() == 1 {
         let point = stroke.points[0];
         cr.new_sub_path();
         cr.arc(
             point.x,
             point.y,
-            stroke.width_at(0).max(0.05) / 2.0,
+            stroke.width_at(0).max(0.05) / 2.0 + extra,
             0.0,
             2.0 * PI,
         );
@@ -169,9 +356,11 @@ fn paint_variable_stroke(cr: &Context, stroke: &Stroke) -> cairo::Result<()> {
         .map(|index| stroke.width_at(index))
         .collect();
     let (points, widths) = smooth_polyline(&stroke.points, &widths);
-    let points = points.as_slice();
-    let widths = widths.as_slice();
+    build_outline_path(cr, &points, &widths, extra);
+    cr.fill()
+}
 
+fn build_outline_path(cr: &Context, points: &[Point], widths: &[f64], extra: f64) {
     let count = points.len();
     let directions: Vec<(f64, f64)> = (0..count)
         .map(|index| direction_at(points, index))
@@ -179,7 +368,7 @@ fn paint_variable_stroke(cr: &Context, stroke: &Stroke) -> cairo::Result<()> {
     let mut left = Vec::with_capacity(count);
     let mut right = Vec::with_capacity(count);
     for index in 0..count {
-        let half = widths[index].max(0.05) / 2.0;
+        let half = widths[index].max(0.05) / 2.0 + extra;
         let (dx, dy) = directions[index];
         let normal = (-dy, dx);
         let point = points[index];
@@ -200,7 +389,7 @@ fn paint_variable_stroke(cr: &Context, stroke: &Stroke) -> cairo::Result<()> {
         cr.line_to(point.x, point.y);
     }
 
-    let end_half = widths[last].max(0.05) / 2.0;
+    let end_half = widths[last].max(0.05) / 2.0 + extra;
     for point in cap_points(
         points[last],
         end_half,
@@ -215,14 +404,13 @@ fn paint_variable_stroke(cr: &Context, stroke: &Stroke) -> cairo::Result<()> {
         cr.line_to(point.x, point.y);
     }
 
-    let start_half = widths[0].max(0.05) / 2.0;
+    let start_half = widths[0].max(0.05) / 2.0 + extra;
     let backward = Point::new(-directions[0].0, -directions[0].1);
     for point in cap_points(points[0], start_half, right[0], left[0], backward) {
         cr.line_to(point.x, point.y);
     }
 
     cr.close_path();
-    cr.fill()
 }
 
 /// 用向心 Catmull-Rom（alpha = 0.5）把采样点加密成平滑折线。
