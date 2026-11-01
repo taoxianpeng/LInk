@@ -27,13 +27,6 @@ pub fn fill_rounded(painter: &egui::Painter, rect: Rect, radius: u8, color: Colo
     painter.rect_filled(rect, CornerRadius::same(radius), color);
 }
 
-/// 一行：左边小标题、右边内容。
-pub fn section_label(ui: &mut egui::Ui, text: &str) {
-    ui.add_space(2.0);
-    ui.label(egui::RichText::new(text).font(small()).color(DIM).strong());
-    ui.add_space(4.0);
-}
-
 /// 图标按钮（自绘图标），返回是否被点击。
 pub fn icon_button(
     ui: &mut egui::Ui,

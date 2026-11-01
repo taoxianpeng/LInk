@@ -6,6 +6,7 @@
 mod dialog;
 mod glyphs;
 mod ipc;
+mod settings;
 mod theme;
 
 use std::time::{Duration, Instant};
@@ -16,10 +17,16 @@ use eframe::egui::{
 use link_ipc::{BackgroundDto, Command, Event, ImageFormatDto, ToolDto};
 
 use crate::glyphs::Glyph;
+use crate::settings::Settings;
 use crate::theme::*;
 
-const TOOL_BUTTON: f32 = 42.0;
-const SWATCH: f32 = 22.0;
+const TOOL_BUTTON: f32 = 34.0;
+const SWATCH: f32 = 16.0;
+const ACTION_BUTTON: f32 = 24.0;
+const LAYER_LIST_MAX_HEIGHT: f32 = 150.0;
+const PANEL_WIDTH: f32 = 300.0;
+const PANEL_MIN_HEIGHT: f32 = 320.0;
+const PANEL_MAX_HEIGHT: f32 = 640.0;
 
 struct LayerUi {
     id: usize,
@@ -33,8 +40,10 @@ struct LayerUi {
 enum Action {
     SetTool(ToolDto),
     SetColor([u8; 4]),
-    SetWidth(f64),
+    SetWidthPreset(usize),
+    ApplyWidth,
     SetPressure,
+    OpenSettings,
     AddLayer,
     RemoveLayer,
     MoveLayer(bool),
@@ -42,6 +51,7 @@ enum Action {
     RenameLayer(usize, String),
     ToggleLayer(usize, bool),
     ClearLayer,
+    Undo,
     Passthrough(bool),
     Open,
     Save,
@@ -80,9 +90,10 @@ struct PanelApp {
 
     tool: ToolDto,
     color: [u8; 4],
-    width: f64,
-    gamma: f64,
-    min_ratio: f64,
+    settings: Settings,
+    show_settings: bool,
+    settings_dirty: bool,
+    settings_save_at: Option<Instant>,
 
     device: Option<(String, String, f64, bool)>,
     error: Option<(String, Instant)>,
@@ -95,7 +106,6 @@ struct PanelApp {
 
     ready: bool,
     start: Instant,
-    list_height: f32,
     pending: Option<PendingPick>,
     /// 需要把面板提到画布之上（画布是全屏置顶窗口，会盖住面板）。
     raise_at: Option<Instant>,
@@ -112,6 +122,7 @@ impl PanelApp {
             Ok(client) => (Some(client), None),
             Err(error) => (None, Some(error)),
         };
+        let settings = Settings::load();
 
         Self {
             client,
@@ -121,9 +132,10 @@ impl PanelApp {
             passthrough: false,
             tool: ToolDto::Pen,
             color: [0x1C, 0x1C, 0x22, 0xFF],
-            width: 2.0,
-            gamma: 1.0,
-            min_ratio: 0.25,
+            settings,
+            show_settings: false,
+            settings_dirty: false,
+            settings_save_at: None,
             device: None,
             error: None,
             rename: None,
@@ -133,7 +145,6 @@ impl PanelApp {
             export_screen: false,
             ready: false,
             start: Instant::now(),
-            list_height: 180.0,
             pending: None,
             raise_at: None,
             x11_window: x11_window_id(cc),
@@ -151,15 +162,28 @@ impl PanelApp {
                 self.color = rgba;
                 self.send(Command::SetColor { rgba });
             }
-            Action::SetWidth(pt) => {
-                self.width = pt;
-                self.send(Command::SetWidth { pt });
+            Action::SetWidthPreset(index) => {
+                self.settings.set_preset(index);
+                self.send(Command::SetWidth {
+                    pt: self.settings.width(),
+                });
+                self.mark_settings_dirty(ctx);
+            }
+            Action::ApplyWidth => {
+                self.send(Command::SetWidth {
+                    pt: self.settings.width(),
+                });
+                self.mark_settings_dirty(ctx);
             }
             Action::SetPressure => {
                 self.send(Command::SetPressure {
-                    gamma: self.gamma,
-                    min_ratio: self.min_ratio,
+                    gamma: self.settings.gamma,
+                    min_ratio: self.settings.min_ratio,
                 });
+                self.mark_settings_dirty(ctx);
+            }
+            Action::OpenSettings => {
+                self.show_settings = true;
             }
             Action::AddLayer => self.send(Command::LayerAdd),
             Action::RemoveLayer => self.send(Command::LayerRemove),
@@ -170,6 +194,7 @@ impl PanelApp {
                 self.send(Command::LayerVisibility { index, visible })
             }
             Action::ClearLayer => self.send(Command::ClearLayer),
+            Action::Undo => self.send(Command::Undo),
             Action::Passthrough(enabled) => self.send(Command::SetPassthrough { enabled }),
             Action::Open => self.start_pick(ctx, PickKind::OpenXopp),
             Action::Save => self.start_pick(ctx, PickKind::SaveXopp),
@@ -190,6 +215,7 @@ impl PanelApp {
                 };
             }
             Action::Quit => {
+                self.save_settings_now();
                 self.send(Command::Quit);
                 std::process::exit(0);
             }
@@ -255,12 +281,32 @@ impl PanelApp {
         for event in events {
             match event {
                 Event::Ready { proto, monitor } => {
+                    if proto != link_ipc::PROTOCOL_VERSION {
+                        // 典型场景：cargo run 只重建了面板，画布还是旧的。
+                        let message = format!(
+                            "画布版本不匹配（面板 {}，画布 {}）：请执行 `cargo build --workspace` 重新构建两个可执行文件",
+                            link_ipc::PROTOCOL_VERSION,
+                            proto
+                        );
+                        log::error!("{message}");
+                        self.toast(ctx, message);
+                        self.client = None;
+                        self.startup_error = Some("画布与面板版本不一致，已停止连接".to_string());
+                        return;
+                    }
                     self.ready = true;
                     log::info!(
                         "画布就绪：协议 {proto}，显示器 {}x{}",
                         monitor.width,
                         monitor.height
                     );
+                    self.send(Command::SetWidth {
+                        pt: self.settings.width(),
+                    });
+                    self.send(Command::SetPressure {
+                        gamma: self.settings.gamma,
+                        min_ratio: self.settings.min_ratio,
+                    });
                     let elapsed = self.start.elapsed();
                     log::info!("面板冷启动 -> 画布就绪: {:?}", elapsed);
                     self.raise_at = Some(Instant::now() + Duration::from_millis(250));
@@ -300,6 +346,18 @@ impl PanelApp {
                     self.toast(ctx, message);
                 }
                 Event::Error { message } => {
+                    // 握手阶段的错误几乎都是"新面板配旧画布"：旧二进制只会报它自己的
+                    // 版本号，所以由面板补上"该怎么办"，否则用户看到报错也不知道如何修。
+                    if !self.ready {
+                        let hint = format!(
+                            "{message}\n请执行 `cargo build --workspace` 重新构建两个可执行文件"
+                        );
+                        log::error!("{hint}");
+                        self.toast(ctx, hint);
+                        self.client = None;
+                        self.startup_error = Some("画布未能建立连接".to_string());
+                        return;
+                    }
                     self.toast(ctx, message);
                 }
             }
@@ -346,6 +404,34 @@ impl PanelApp {
         log::info!("{message}");
         self.error = Some((message, Instant::now()));
         ctx.request_repaint_after(Duration::from_secs(3));
+    }
+
+    fn mark_settings_dirty(&mut self, ctx: &egui::Context) {
+        self.settings_dirty = true;
+        self.settings_save_at = Some(Instant::now() + Duration::from_millis(400));
+        ctx.request_repaint_after(Duration::from_millis(450));
+    }
+
+    fn flush_settings(&mut self, ctx: &egui::Context) {
+        if !self.settings_dirty {
+            return;
+        }
+        if let Some(at) = self.settings_save_at {
+            if Instant::now() < at {
+                ctx.request_repaint_after(Duration::from_millis(80));
+                return;
+            }
+        }
+        self.save_settings_now();
+    }
+
+    fn save_settings_now(&mut self) {
+        match self.settings.save() {
+            Ok(()) => log::debug!("设置已保存"),
+            Err(error) => log::warn!("保存设置失败: {error}"),
+        }
+        self.settings_dirty = false;
+        self.settings_save_at = None;
     }
 }
 
@@ -420,9 +506,9 @@ fn install_style(ctx: &egui::Context) {
         style.visuals.widgets.active.bg_stroke = Stroke::NONE;
         style.visuals.selection.bg_fill = ACCENT;
         style.visuals.selection.stroke = Stroke::new(1.0, Color32::WHITE);
-        style.spacing.item_spacing = Vec2::new(8.0, 6.0);
-        style.spacing.button_padding = Vec2::new(8.0, 4.0);
-        style.spacing.slider_width = 150.0;
+        style.spacing.item_spacing = Vec2::new(6.0, 5.0);
+        style.spacing.button_padding = Vec2::new(6.0, 3.0);
+        style.spacing.slider_width = 140.0;
     });
 }
 
@@ -439,36 +525,34 @@ impl eframe::App for PanelApp {
         self.keep_on_top(&ctx);
 
         let mut actions: Vec<Action> = Vec::new();
+        let mut content_bottom = 0.0;
 
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
                     .fill(PANEL_BG)
                     .corner_radius(CornerRadius::same(RADIUS_PANEL))
-                    .inner_margin(egui::Margin::same(12)),
+                    .inner_margin(egui::Margin::same(10)),
             )
             .show(ui, |ui| {
                 self.titlebar(ui, &ctx, &mut actions);
-                ui.add_space(8.0);
                 self.passthrough_row(ui, &mut actions);
                 separator(ui);
                 self.tools_row(ui, &mut actions);
+                self.colors_row(ui, &mut actions);
+                self.width_row(ui, &mut actions);
                 separator(ui);
-                self.colors_grid(ui, &mut actions);
-                separator(ui);
-                self.sliders(ui, &mut actions);
-                separator(ui);
-                self.list_height = (ui.available_height() - 132.0).max(72.0);
                 self.layers_section(ui, &mut actions);
-                ui.add_space(6.0);
-                separator(ui);
-                self.footer(ui, &mut actions);
+                content_bottom = self.footer(ui, &mut actions);
             });
 
+        self.fit_height(&ctx, content_bottom);
         self.export_window(&ctx, &mut actions);
+        self.settings_window(&ctx, &mut actions);
         self.rename_window(&ctx, &mut actions);
         self.preview_window(&ctx);
         self.toast_banner(&ctx);
+        self.flush_settings(&ctx);
 
         for action in actions {
             self.dispatch(&ctx, action);
@@ -477,6 +561,25 @@ impl eframe::App for PanelApp {
 }
 
 impl PanelApp {
+    /// 面板高度跟随内容，避免图层少时留下大块空白。
+    fn fit_height(&self, ctx: &egui::Context, content_bottom: f32) {
+        if !content_bottom.is_finite() || content_bottom <= 0.0 {
+            return;
+        }
+        let screen = ctx.content_rect();
+        let desired = (content_bottom - screen.top() + 10.0)
+            .ceil()
+            .clamp(PANEL_MIN_HEIGHT, PANEL_MAX_HEIGHT);
+        if (desired - screen.height()).abs() > 1.0 {
+            log::debug!("调整面板高度：{:.1} -> {desired:.1}", screen.height());
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(
+                screen.width().max(PANEL_WIDTH),
+                desired,
+            )));
+            ctx.request_repaint();
+        }
+    }
+
     /// 画布是“全屏 + 置顶”的窗口，且比面板后创建，会压在面板上面吞掉点击。
     /// 画布就绪（以及每次导出后画布重新 show）之后，把面板重新提到最前。
     fn keep_on_top(&mut self, ctx: &egui::Context) {
@@ -496,8 +599,8 @@ impl PanelApp {
 
     fn titlebar(&self, ui: &mut egui::Ui, ctx: &egui::Context, actions: &mut Vec<Action>) {
         ui.horizontal(|ui| {
-            let width = (ui.available_width() - 26.0).max(40.0);
-            let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 24.0), Sense::drag());
+            let width = (ui.available_width() - 50.0).max(40.0);
+            let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 22.0), Sense::drag());
             if response.drag_started() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
             }
@@ -506,22 +609,23 @@ impl PanelApp {
                 rect.left_center() + Vec2::new(2.0, 0.0),
                 Align2::LEFT_CENTER,
                 "LInk",
-                FontId::proportional(15.0),
+                FontId::proportional(14.0),
                 TEXT,
             );
             painter.circle_filled(
-                Pos2::new(rect.left() + 46.0, rect.center().y),
+                Pos2::new(rect.left() + 40.0, rect.center().y),
                 3.0,
                 if self.ready { ACCENT } else { DIM },
             );
-            painter.text(
-                Pos2::new(rect.left() + 54.0, rect.center().y),
-                Align2::LEFT_CENTER,
-                if self.ready { "已连接" } else { "连接中" },
-                FontId::proportional(11.0),
-                DIM,
-            );
-            if icon_button(ui, Glyph::Close, Vec2::splat(24.0), false, "退出") {
+            response.on_hover_text(if self.ready {
+                "画布已连接"
+            } else {
+                "画布连接中"
+            });
+            if icon_button(ui, Glyph::Gear, Vec2::splat(22.0), false, "设置") {
+                actions.push(Action::OpenSettings);
+            }
+            if icon_button(ui, Glyph::Close, Vec2::splat(22.0), false, "退出") {
                 actions.push(Action::Quit);
             }
         });
@@ -529,40 +633,35 @@ impl PanelApp {
 
     fn passthrough_row(&self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("穿透模式").font(body()).color(TEXT));
+            ui.label(RichText::new("穿透").font(body()).color(TEXT));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let enabled = self.passthrough;
                 let (rect, response) =
-                    ui.allocate_exact_size(Vec2::new(38.0, 20.0), Sense::click());
+                    ui.allocate_exact_size(Vec2::new(34.0, 18.0), Sense::click());
                 let painter = ui.painter();
                 let bg = if enabled {
                     ACCENT
                 } else {
                     Color32::from_rgb(0xDD, 0xDD, 0xE6)
                 };
-                painter.rect_filled(rect, CornerRadius::same(10), bg);
+                painter.rect_filled(rect, CornerRadius::same(9), bg);
                 let knob_x = if enabled {
-                    rect.right() - 10.0
+                    rect.right() - 9.0
                 } else {
-                    rect.left() + 10.0
+                    rect.left() + 9.0
                 };
-                painter.circle_filled(Pos2::new(knob_x, rect.center().y), 7.0, Color32::WHITE);
-                if response.clicked() {
+                painter.circle_filled(Pos2::new(knob_x, rect.center().y), 6.0, Color32::WHITE);
+                if response
+                    .on_hover_text("鼠标与笔事件穿透到下层 (F8)")
+                    .clicked()
+                {
                     actions.push(Action::Passthrough(!enabled));
                 }
             });
         });
-        if self.passthrough {
-            ui.label(
-                RichText::new("鼠标与笔事件已交给下方应用，快捷键 F8 退出穿透")
-                    .font(small())
-                    .color(DIM),
-            );
-        }
     }
 
     fn tools_row(&self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
-        section_label(ui, "工具");
         ui.horizontal(|ui| {
             let tools = [
                 (Glyph::Pen, ToolDto::Pen, "画笔 (P)"),
@@ -579,8 +678,7 @@ impl PanelApp {
         });
     }
 
-    fn colors_grid(&self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
-        section_label(ui, "颜色");
+    fn colors_row(&self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         const PALETTE: [[u8; 4]; 12] = [
             [28, 28, 34, 255],
             [220, 38, 38, 255],
@@ -595,46 +693,44 @@ impl PanelApp {
             [120, 113, 108, 255],
             [255, 255, 255, 255],
         ];
-        for (row, chunk) in PALETTE.chunks(6).enumerate() {
-            ui.horizontal(|ui| {
-                for (column, rgba) in chunk.iter().enumerate() {
-                    let selected = self.color == *rgba;
-                    let (rect, response) =
-                        ui.allocate_exact_size(Vec2::splat(SWATCH), Sense::click());
-                    let painter = ui.painter();
-                    painter.circle_filled(
-                        rect.center(),
-                        SWATCH * 0.5,
-                        Color32::from_rgba_unmultiplied(rgba[0], rgba[1], rgba[2], rgba[3]),
-                    );
-                    if selected {
-                        painter.circle_stroke(
-                            rect.center(),
-                            SWATCH * 0.5 + 2.0,
-                            Stroke::new(2.0, ACCENT),
-                        );
-                    } else if response.hovered() {
-                        painter.circle_stroke(
-                            rect.center(),
-                            SWATCH * 0.5 + 1.0,
-                            Stroke::new(1.0, BORDER),
-                        );
-                    }
-                    if response.clicked() {
-                        actions.push(Action::SetColor(*rgba));
-                    }
-                    let _ = (row, column);
-                }
-            });
-        }
         ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for rgba in PALETTE {
+                let selected = self.color == rgba;
+                let (rect, response) = ui.allocate_exact_size(Vec2::splat(SWATCH), Sense::click());
+                let painter = ui.painter();
+                painter.circle_filled(
+                    rect.center(),
+                    SWATCH * 0.5,
+                    Color32::from_rgba_unmultiplied(rgba[0], rgba[1], rgba[2], rgba[3]),
+                );
+                let luminance =
+                    0.299 * rgba[0] as f32 + 0.587 * rgba[1] as f32 + 0.114 * rgba[2] as f32;
+                if luminance > 220.0 && !selected {
+                    painter.circle_stroke(rect.center(), SWATCH * 0.5, Stroke::new(1.0, BORDER));
+                }
+                if selected {
+                    painter.circle_stroke(
+                        rect.center(),
+                        SWATCH * 0.5 + 1.5,
+                        Stroke::new(2.0, ACCENT),
+                    );
+                }
+                if response.clicked() {
+                    actions.push(Action::SetColor(rgba));
+                }
+            }
             let mut color = Color32::from_rgba_unmultiplied(
                 self.color[0],
                 self.color[1],
                 self.color[2],
                 self.color[3],
             );
-            if ui.color_edit_button_srgba(&mut color).changed() {
+            if ui
+                .color_edit_button_srgba(&mut color)
+                .on_hover_text("自定义颜色")
+                .changed()
+            {
                 actions.push(Action::SetColor([
                     color.r(),
                     color.g(),
@@ -642,62 +738,73 @@ impl PanelApp {
                     color.a(),
                 ]));
             }
-            ui.label(RichText::new("自定义").font(small()).color(DIM));
         });
     }
 
-    fn sliders(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
-        section_label(ui, "笔迹");
+    fn width_row(&self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         ui.horizontal(|ui| {
-            field_label(ui, "笔宽");
-            let response = ui.add(
-                egui::Slider::new(&mut self.width, 0.5..=20.0)
-                    .fixed_decimals(1)
-                    .suffix(" pt"),
-            );
-            if response.changed() {
-                actions.push(Action::SetWidth(self.width));
+            ui.label(RichText::new("笔宽").font(small()).color(DIM));
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for (index, label) in settings::PRESET_LABELS.iter().enumerate() {
+                let selected = self.settings.width_preset == index;
+                let hint = format!("{label} · {:.1} pt", self.settings.width_presets[index]);
+                if ui
+                    .selectable_label(selected, RichText::new(*label).font(small()))
+                    .on_hover_text(hint)
+                    .clicked()
+                {
+                    actions.push(Action::SetWidthPreset(index));
+                }
             }
-        });
-        ui.horizontal(|ui| {
-            field_label(ui, "压感曲线");
-            let response = ui.add(egui::Slider::new(&mut self.gamma, 0.5..=3.0).fixed_decimals(2));
-            if response.changed() {
-                actions.push(Action::SetPressure);
-            }
-        });
-        ui.horizontal(|ui| {
-            field_label(ui, "最细比例");
-            let response =
-                ui.add(egui::Slider::new(&mut self.min_ratio, 0.05..=1.0).fixed_decimals(2));
-            if response.changed() {
-                actions.push(Action::SetPressure);
-            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    RichText::new(format!("{:.1} pt", self.settings.width()))
+                        .font(small())
+                        .color(DIM),
+                );
+            });
         });
     }
 
     fn layers_section(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("图层").font(body()).color(TEXT));
+            ui.label(
+                RichText::new(format!("图层 · {}", self.layers.len()))
+                    .font(small())
+                    .color(DIM),
+            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if icon_button(ui, Glyph::Down, Vec2::splat(26.0), false, "下移") {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                if icon_button(ui, Glyph::Down, Vec2::splat(ACTION_BUTTON), false, "下移") {
                     actions.push(Action::MoveLayer(false));
                 }
-                if icon_button(ui, Glyph::Up, Vec2::splat(26.0), false, "上移") {
+                if icon_button(ui, Glyph::Up, Vec2::splat(ACTION_BUTTON), false, "上移") {
                     actions.push(Action::MoveLayer(true));
                 }
-                if icon_button(ui, Glyph::Minus, Vec2::splat(26.0), false, "删除图层") {
+                if icon_button(
+                    ui,
+                    Glyph::Minus,
+                    Vec2::splat(ACTION_BUTTON),
+                    false,
+                    "删除图层",
+                ) {
                     actions.push(Action::RemoveLayer);
                 }
-                if icon_button(ui, Glyph::Plus, Vec2::splat(26.0), false, "新建图层") {
+                if icon_button(
+                    ui,
+                    Glyph::Plus,
+                    Vec2::splat(ACTION_BUTTON),
+                    false,
+                    "新建图层",
+                ) {
                     actions.push(Action::AddLayer);
                 }
             });
         });
-        ui.add_space(2.0);
+        ui.add_space(1.0);
         egui::ScrollArea::vertical()
-            .max_height(self.list_height)
-            .auto_shrink([false, false])
+            .max_height(LAYER_LIST_MAX_HEIGHT)
+            .auto_shrink([false, true])
             .show(ui, |ui| {
                 // 顶层显示在列表上方
                 let mut items: Vec<(usize, usize, String, bool, Option<egui::TextureHandle>)> =
@@ -730,7 +837,7 @@ impl PanelApp {
         actions: &mut Vec<Action>,
     ) {
         let selected = index == self.active;
-        let height = 34.0;
+        let height = 28.0;
         let (rect, response) =
             ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::click());
         let painter = ui.painter();
@@ -750,8 +857,8 @@ impl PanelApp {
 
         // 眼睛
         let eye_rect = Rect::from_min_size(
-            rect.left_top() + Vec2::new(5.0, (height - 22.0) / 2.0),
-            Vec2::splat(22.0),
+            rect.left_top() + Vec2::new(4.0, (height - 18.0) / 2.0),
+            Vec2::splat(18.0),
         );
         let eye_response = ui.interact(eye_rect, ui.scope_id().with(("eye", id)), Sense::click());
         glyphs::paint(
@@ -770,8 +877,8 @@ impl PanelApp {
 
         // 缩略图
         let thumb_rect = Rect::from_min_size(
-            eye_rect.right_top() + Vec2::new(2.0, 1.0),
-            Vec2::new(42.0, 22.0),
+            eye_rect.right_top() + Vec2::new(2.0, 0.0),
+            Vec2::new(38.0, 18.0),
         );
         let thumb_response = ui.interact(
             thumb_rect,
@@ -804,8 +911,8 @@ impl PanelApp {
 
         // 名字
         let name_rect = Rect::from_min_max(
-            Pos2::new(thumb_rect.right() + 8.0, rect.top()),
-            Pos2::new(rect.right() - 6.0, rect.bottom()),
+            Pos2::new(thumb_rect.right() + 6.0, rect.top()),
+            Pos2::new(rect.right() - 4.0, rect.bottom()),
         );
         painter.text(
             name_rect.left_center(),
@@ -816,17 +923,24 @@ impl PanelApp {
         );
         let name_response =
             ui.interact(name_rect, ui.scope_id().with(("name", id)), Sense::click());
+        // 名字区域盖住了整行的绝大部分，单击必须能选中图层；
+        // 双击 = 选中并进入改名（与常见绘图软件一致）。
+        if name_response.clicked() {
+            actions.push(Action::SelectLayer(index));
+        }
         if name_response.double_clicked() {
             actions.push(Action::BeginRename(index, name.to_string()));
         }
     }
 
-    fn footer(&self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+    /// 返回状态行底边，供面板按内容调整高度。
+    fn footer(&self, ui: &mut egui::Ui, actions: &mut Vec<Action>) -> f32 {
+        ui.add_space(4.0);
         ui.horizontal(|ui| {
             if icon_button(
                 ui,
                 Glyph::Folder,
-                Vec2::splat(30.0),
+                Vec2::splat(ACTION_BUTTON),
                 false,
                 "打开工程 (Ctrl+O)",
             ) {
@@ -835,7 +949,7 @@ impl PanelApp {
             if icon_button(
                 ui,
                 Glyph::Save,
-                Vec2::splat(30.0),
+                Vec2::splat(ACTION_BUTTON),
                 false,
                 "保存工程 (Ctrl+S)",
             ) {
@@ -844,36 +958,125 @@ impl PanelApp {
             if icon_button(
                 ui,
                 Glyph::Export,
-                Vec2::splat(30.0),
+                Vec2::splat(ACTION_BUTTON),
                 false,
                 "导出图片 (Ctrl+E)",
             ) {
                 actions.push(Action::Export);
             }
-            let remaining = ui.available_width() - 30.0;
+            let remaining = ui.available_width() - ACTION_BUTTON;
             if remaining > 0.0 {
                 ui.add_space(remaining);
             }
-            if icon_button(ui, Glyph::Trash, Vec2::splat(32.0), false, "清空当前图层") {
+            if icon_button(
+                ui,
+                Glyph::Trash,
+                Vec2::splat(ACTION_BUTTON),
+                false,
+                "清空当前图层",
+            ) {
                 actions.push(Action::ClearLayer);
             }
         });
-        ui.add_space(2.0);
         let status = match &self.device {
             Some((name, tool, pressure, has_pressure)) => {
                 if *has_pressure {
-                    format!("{name} · {tool} · 压感 {:.0}%", pressure * 100.0)
+                    format!("{name} · {tool} · {:.0}%", pressure * 100.0)
                 } else {
                     format!("{name} · {tool} · 无压感")
                 }
             }
-            None => "等待数位笔…".to_string(),
+            None => "等待笔输入".to_string(),
         };
-        ui.label(RichText::new(status).font(small()).color(DIM));
+        let response =
+            ui.add(egui::Label::new(RichText::new(&status).font(small()).color(DIM)).truncate());
+        let mut bottom = response.on_hover_text(&status).rect.bottom();
 
         if let Some(error) = &self.startup_error {
-            ui.label(RichText::new(error).font(small()).color(DANGER));
+            bottom = ui
+                .label(RichText::new(error).font(small()).color(DANGER))
+                .rect
+                .bottom();
         }
+        bottom
+    }
+
+    fn settings_window(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+        if !self.show_settings {
+            return;
+        }
+        let mut open = self.show_settings;
+        let mut width_changed = false;
+        let mut pressure_changed = false;
+
+        egui::Window::new("设置")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_min_width(250.0);
+                ui.label(RichText::new("笔宽档位").font(small()).color(DIM));
+                for (index, label) in settings::PRESET_LABELS.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        field_label(ui, label);
+                        let mut value = self.settings.width_presets[index];
+                        let response = ui.add(
+                            egui::Slider::new(&mut value, 0.1..=20.0)
+                                .fixed_decimals(1)
+                                .suffix(" pt"),
+                        );
+                        if response.changed() {
+                            self.settings.width_presets[index] = value;
+                            width_changed = true;
+                        }
+                    });
+                }
+                ui.add_space(4.0);
+                ui.label(RichText::new("压感").font(small()).color(DIM));
+                ui.horizontal(|ui| {
+                    field_label(ui, "曲线");
+                    let response = ui.add(
+                        egui::Slider::new(&mut self.settings.gamma, 0.5..=3.0).fixed_decimals(2),
+                    );
+                    if response.changed() {
+                        pressure_changed = true;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    field_label(ui, "最细");
+                    let response = ui.add(
+                        egui::Slider::new(&mut self.settings.min_ratio, 0.05..=1.0)
+                            .fixed_decimals(2),
+                    );
+                    if response.changed() {
+                        pressure_changed = true;
+                    }
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("恢复默认").clicked() {
+                        self.settings = Settings::default();
+                        width_changed = true;
+                        pressure_changed = true;
+                    }
+                    if let Some(path) = settings::path() {
+                        ui.label(RichText::new("设置文件").font(small()).color(DIM))
+                            .on_hover_text(path.display().to_string());
+                    }
+                });
+            });
+
+        if width_changed {
+            actions.push(Action::ApplyWidth);
+        }
+        if pressure_changed {
+            actions.push(Action::SetPressure);
+        }
+        if !open {
+            self.save_settings_now();
+        }
+        self.show_settings = open;
     }
 
     fn export_window(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
@@ -1004,7 +1207,12 @@ impl PanelApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        let (p, e, l, r, o, f8, ctrl_s, ctrl_o, ctrl_e) = ctx.input(|input| {
+        // 有文本框在接收输入时不抢快捷键：否则在图层改名里输入 "p" 会切成画笔，
+        // Ctrl+Z 会撤掉笔迹而不是编辑文字。
+        if ctx.egui_wants_keyboard_input() {
+            return;
+        }
+        let (p, e, l, r, o, f8, ctrl_s, ctrl_o, ctrl_e, ctrl_z) = ctx.input(|input| {
             (
                 input.key_pressed(egui::Key::P),
                 input.key_pressed(egui::Key::E),
@@ -1015,8 +1223,12 @@ impl PanelApp {
                 input.modifiers.command && input.key_pressed(egui::Key::S),
                 input.modifiers.command && input.key_pressed(egui::Key::O),
                 input.modifiers.command && input.key_pressed(egui::Key::E),
+                input.modifiers.command && input.key_pressed(egui::Key::Z),
             )
         });
+        if ctrl_z {
+            self.dispatch(ctx, Action::Undo);
+        }
         if ctrl_s {
             self.dispatch(ctx, Action::Save);
         }
@@ -1084,13 +1296,13 @@ fn raise_window(window: u32) {
 #[cfg(not(all(unix, not(target_os = "macos"))))]
 fn raise_window(_window: u32) {}
 
-/// 固定宽度的字段名，保证三条滑杆左端对齐。
+/// 固定宽度的字段名，保证滑杆左端对齐。
 fn field_label(ui: &mut egui::Ui, text: &str) {
     ui.allocate_ui_with_layout(
-        Vec2::new(62.0, 18.0),
+        Vec2::new(34.0, 16.0),
         egui::Layout::left_to_right(egui::Align::Center),
         |ui| {
-            ui.label(RichText::new(text).font(body()).color(DIM));
+            ui.label(RichText::new(text).font(small()).color(DIM));
         },
     );
 }
@@ -1107,9 +1319,10 @@ fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([352.0, 792.0])
-            .with_min_inner_size([352.0, 560.0])
-            .with_resizable(false)
+            .with_inner_size([PANEL_WIDTH, 340.0])
+            .with_min_inner_size([PANEL_WIDTH, PANEL_MIN_HEIGHT])
+            .with_max_inner_size([PANEL_WIDTH, PANEL_MAX_HEIGHT])
+            .with_resizable(true)
             .with_decorations(false)
             .with_transparent(true)
             .with_always_on_top()

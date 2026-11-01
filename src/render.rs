@@ -27,6 +27,48 @@ pub fn draw_document(cr: &Context, document: &Document, view: &ViewTransform) ->
     cr.restore()
 }
 
+/// 只画 `layer_index` **之上**的那些图层的笔迹。
+///
+/// 草稿（正在画的那一笔）属于当前图层，必须夹在"它下面的层"和"它上面的层"之间；
+/// 否则在非顶层书写时，笔迹会浮在所有图层之上，等到提交（重新合成缓存）才跳回正确位置。
+///
+/// `cull_pt` 是本帧要重绘的页面区域，包围盒不相交的笔迹直接跳过 —— 这条路径每帧都会走，
+/// 上层笔迹多时靠它把成本压在一小块区域内。
+pub fn draw_layers_above(
+    cr: &Context,
+    document: &Document,
+    layer_index: usize,
+    view: &ViewTransform,
+    cull_pt: Option<(f64, f64, f64, f64)>,
+) -> cairo::Result<()> {
+    let above = document.layers.len().saturating_sub(layer_index + 1);
+    if above == 0 {
+        return Ok(());
+    }
+    cr.save()?;
+    apply_transform(cr, view)?;
+    cr.set_line_cap(LineCap::Round);
+    cr.set_line_join(LineJoin::Round);
+    for layer in &document.layers[layer_index + 1..] {
+        if !layer.visible {
+            continue;
+        }
+        for stroke in &layer.strokes {
+            if let Some(cull) = cull_pt {
+                if !rects_overlap(stroke.bounds_pt(), cull) {
+                    continue;
+                }
+            }
+            paint_stroke(cr, stroke)?;
+        }
+    }
+    cr.restore()
+}
+
+fn rects_overlap(a: (f64, f64, f64, f64), b: (f64, f64, f64, f64)) -> bool {
+    a.0 <= b.2 && b.0 <= a.2 && a.1 <= b.3 && b.1 <= a.3
+}
+
 pub fn draw_stroke(cr: &Context, stroke: &Stroke, view: &ViewTransform) -> cairo::Result<()> {
     cr.save()?;
     apply_transform(cr, view)?;

@@ -7,5 +7,6 @@ pub mod model;
 pub mod platform;
 pub mod render;
 pub mod ui;
+pub mod undo;
 pub mod view;
 pub mod xopp;

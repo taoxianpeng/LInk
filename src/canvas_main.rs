@@ -26,6 +26,29 @@ const CAPTURE_DELAY: Duration = Duration::from_millis(150);
 
 type DamageRect = (f64, f64, f64, f64);
 
+/// 下一次绘制要覆盖的范围。
+///
+/// GTK 会把多个指针事件合并成**一次**绘制，所以这里必须累加：只保留最后一帧的矩形
+/// 会让更早那些图形留下的像素永远没被擦掉（形状工具拖动时就是一片残影）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum DrawScope {
+    /// 整屏重绘（图层操作、擦除、导出恢复……），裁剪交给 GTK。
+    Full,
+    /// 只重绘这一块（逻辑坐标）。
+    Partial(DamageRect),
+}
+
+fn merge_scope(previous: Option<DrawScope>, next: DrawScope) -> DrawScope {
+    match (previous, next) {
+        // 只要有一次要求整屏，就必须整屏。
+        (Some(DrawScope::Full), _) | (_, DrawScope::Full) => DrawScope::Full,
+        (Some(DrawScope::Partial(a)), DrawScope::Partial(b)) => {
+            DrawScope::Partial((a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3)))
+        }
+        (None, next) => next,
+    }
+}
+
 struct GtkCanvasHost {
     platform: Rc<X11Platform>,
     window: gtk::Window,
@@ -130,7 +153,7 @@ fn build_canvas(app: &gtk::Application) -> Result<(), PlatformError> {
     let area_slot: Rc<RefCell<Option<gtk::DrawingArea>>> = Rc::new(RefCell::new(None));
     let last_damage: Rc<Cell<Option<DamageRect>>> = Rc::new(Cell::new(None));
 
-    let pending_draw: Rc<Cell<Option<DamageRect>>> = Rc::new(Cell::new(None));
+    let pending_draw: Rc<Cell<Option<DrawScope>>> = Rc::new(Cell::new(None));
     let on_event = {
         let canvas = canvas.clone();
         let area_slot = area_slot.clone();
@@ -160,7 +183,10 @@ fn build_canvas(app: &gtk::Application) -> Result<(), PlatformError> {
         let canvas = canvas.clone();
         let pending_draw = pending_draw.clone();
         Rc::new(move |cr: &cairo::Context| {
-            let damage = pending_draw.take();
+            let damage = match pending_draw.take() {
+                Some(DrawScope::Partial(rect)) => Some(rect),
+                Some(DrawScope::Full) | None => None,
+            };
             canvas.borrow_mut().draw(cr, damage);
         })
     };
@@ -251,7 +277,7 @@ fn build_canvas(app: &gtk::Application) -> Result<(), PlatformError> {
                 emit(events);
                 if needs_redraw {
                     last_damage.set(None);
-                    pending_draw.set(None);
+                    pending_draw.set(Some(DrawScope::Full));
                     area.queue_draw();
                 }
             }
@@ -361,7 +387,7 @@ fn queue_damage(
     damage_page: Option<DamageRect>,
     erasing: bool,
     last_damage: &Rc<Cell<Option<DamageRect>>>,
-    pending_draw: &Rc<Cell<Option<DamageRect>>>,
+    pending_draw: &Rc<Cell<Option<DrawScope>>>,
 ) {
     let current = damage_page.map(|(x0, y0, x1, y1)| {
         let (ax, ay) = view.page_to_logical(Point::new(x0, y0));
@@ -370,24 +396,20 @@ fn queue_damage(
     });
     let previous = last_damage.replace(current);
     if erasing {
-        pending_draw.set(None);
+        pending_draw.set(Some(DrawScope::Full));
         area.queue_draw();
         return;
     }
     let Some(rect) = union_rect(current, previous) else {
         log::trace!("脏矩形: 无（回退整屏）");
-        pending_draw.set(None);
+        pending_draw.set(Some(DrawScope::Full));
         area.queue_draw();
         return;
     };
     let (x, y, width, height) = integer_rect(rect);
-    log::trace!("脏矩形: ({x},{y}) {width}x{height}，current={current:?} previous={previous:?}");
-    pending_draw.set(Some((
-        rect.0 - 2.0,
-        rect.1 - 2.0,
-        rect.2 + 2.0,
-        rect.3 + 2.0,
-    )));
+    log::trace!("脏矩形: ({x},{y}) {width}x{height}");
+    let scope = DrawScope::Partial((rect.0 - 2.0, rect.1 - 2.0, rect.2 + 2.0, rect.3 + 2.0));
+    pending_draw.set(Some(merge_scope(pending_draw.get(), scope)));
     area.queue_draw_area(x, y, width, height);
 }
 
@@ -406,4 +428,39 @@ fn integer_rect(rect: DamageRect) -> (i32, i32, i32, i32) {
     let x1 = rect.2.ceil() as i32 + 1;
     let y1 = rect.3.ceil() as i32 + 1;
     (x0, y0, (x1 - x0).max(1), (y1 - y0).max(1))
+}
+
+#[cfg(test)]
+mod draw_scope_tests {
+    use super::{merge_scope, DrawScope};
+
+    fn rect(x0: f64, y0: f64, x1: f64, y1: f64) -> DrawScope {
+        DrawScope::Partial((x0, y0, x1, y1))
+    }
+
+    #[test]
+    fn partial_damages_accumulate_instead_of_replacing() {
+        // 两个事件在一次绘制前到达：必须取并集，否则前一个图形的像素不会被擦掉。
+        let first = merge_scope(None, rect(0.0, 0.0, 10.0, 10.0));
+        let both = merge_scope(Some(first), rect(20.0, 20.0, 30.0, 30.0));
+        assert_eq!(both, rect(0.0, 0.0, 30.0, 30.0));
+    }
+
+    #[test]
+    fn full_repaint_wins_over_partial() {
+        let partial = merge_scope(None, rect(0.0, 0.0, 10.0, 10.0));
+        assert_eq!(merge_scope(Some(partial), DrawScope::Full), DrawScope::Full);
+        assert_eq!(
+            merge_scope(Some(DrawScope::Full), rect(5.0, 5.0, 6.0, 6.0)),
+            DrawScope::Full
+        );
+    }
+
+    #[test]
+    fn first_scope_is_kept_as_is() {
+        assert_eq!(
+            merge_scope(None, rect(1.0, 2.0, 3.0, 4.0)),
+            rect(1.0, 2.0, 3.0, 4.0)
+        );
+    }
 }
