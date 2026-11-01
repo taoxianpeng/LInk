@@ -1,4 +1,7 @@
+use link_ink::app::Tool;
 use link_ink::canvas_app::{CanvasApp, CanvasHost};
+use link_ink::input::{InputEvent, PointerSample, ToolKind};
+use link_ink::model::{Point, Rgba, Stroke};
 use link_ink::platform::{CaptureImage, MonitorInfo, PlatformError, RectF, RectI};
 use link_ipc::{BackgroundDto, Command, Event, ImageFormatDto, PROTOCOL_VERSION};
 
@@ -238,4 +241,85 @@ fn undo_command_removes_last_stroke_and_reports_state() {
     // 再撤一次没有内容，不应产生状态事件
     let events = canvas.handle_command(Command::Undo, &mut host);
     assert!(events.is_empty(), "空历史不该回状态，实际 {events:?}");
+}
+
+fn selection_sample(view: &link_ink::view::ViewTransform, page: Point) -> PointerSample {
+    let (x, y) = view.page_to_logical(page);
+    PointerSample {
+        logical: (x, y),
+        pressure: 1.0,
+        pressure_available: false,
+        device_has_pressure: false,
+        tool: ToolKind::Mouse,
+        device_name: "测试鼠标".to_string(),
+        tilt: None,
+        shift: false,
+    }
+}
+
+#[test]
+fn selection_commands_update_state_and_apply_edits() {
+    let (mut canvas, mut host) = setup();
+    {
+        let app = canvas.app_mut();
+        app.document.add_layer_above_active();
+        app.document.active = 0;
+        app.document.layers[0].strokes.push(Stroke::constant(
+            Rgba::BLACK,
+            2.0,
+            vec![Point::new(20.0, 20.0), Point::new(40.0, 40.0)],
+        ));
+        app.set_tool(Tool::SelectRect);
+    }
+    let view = canvas.view();
+    canvas.on_input(InputEvent::Down(selection_sample(
+        &view,
+        Point::new(5.0, 5.0),
+    )));
+    canvas.on_input(InputEvent::Move(selection_sample(
+        &view,
+        Point::new(60.0, 60.0),
+    )));
+    let events = canvas.on_input(InputEvent::Up(selection_sample(
+        &view,
+        Point::new(60.0, 60.0),
+    )));
+    assert!(
+        matches!(events.first(), Some(Event::State { selection: 1, .. })),
+        "框选后应回传 selection=1，实际 {events:?}"
+    );
+
+    let events = canvas.handle_command(Command::ScaleSelection { factor: 2.0 }, &mut host);
+    assert!(matches!(
+        events.first(),
+        Some(Event::State { selection: 1, .. })
+    ));
+    assert_eq!(
+        canvas.app().document.layers[0].strokes[0].base_width_pt,
+        4.0
+    );
+    assert!(canvas.take_redraw());
+
+    let events = canvas.handle_command(Command::MoveSelectionToLayer { index: 1 }, &mut host);
+    assert!(matches!(events.first(), Some(Event::State { .. })));
+    assert_eq!(canvas.app().document.layers[0].strokes.len(), 0);
+    assert_eq!(canvas.app().document.layers[1].strokes.len(), 1);
+
+    let events = canvas.handle_command(
+        Command::RecolorSelection {
+            rgba: [255, 0, 0, 255],
+        },
+        &mut host,
+    );
+    assert!(matches!(events.first(), Some(Event::State { .. })));
+    assert_eq!(
+        canvas.app().document.layers[1].strokes[0].color,
+        Rgba::new(255, 0, 0, 255)
+    );
+
+    let events = canvas.handle_command(Command::ClearSelection, &mut host);
+    assert!(matches!(
+        events.first(),
+        Some(Event::State { selection: 0, .. })
+    ));
 }

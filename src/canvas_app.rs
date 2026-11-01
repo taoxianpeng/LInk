@@ -65,6 +65,10 @@ impl CanvasApp {
         &self.app
     }
 
+    pub fn app_mut(&mut self) -> &mut App {
+        &mut self.app
+    }
+
     pub fn monitor(&self) -> MonitorInfo {
         self.monitor
     }
@@ -90,10 +94,20 @@ impl CanvasApp {
     /// 处理一条输入事件，返回要发给面板的事件。
     pub fn on_input(&mut self, event: InputEvent) -> Vec<Event> {
         let strokes_before = self.stroke_count();
+        let selection_before = self.app.selection_len();
+        let revision_before = self.app.selection_revision();
         self.redraw |= self.app.handle_input(event, &self.view);
+        let revision_changed = self.app.selection_revision() != revision_before;
+        if revision_changed {
+            self.cache.invalidate();
+        }
         let mut events = Vec::new();
-        if self.stroke_count() != strokes_before {
-            events.push(self.state_event(true));
+        if !self.app.is_selection_transient() {
+            let strokes_changed = self.stroke_count() != strokes_before;
+            let selection_changed = self.app.selection_len() != selection_before;
+            if strokes_changed || selection_changed || revision_changed {
+                events.push(self.state_event(strokes_changed || revision_changed));
+            }
         }
         if let Some(device) = self.device_event() {
             events.push(device);
@@ -145,6 +159,7 @@ impl CanvasApp {
             layers,
             active: document.active,
             passthrough: self.passthrough,
+            selection: self.app.selection_len(),
         }
     }
 
@@ -163,8 +178,12 @@ impl CanvasApp {
                 vec![self.ready_event(), self.state_event(true)]
             }
             Command::SetTool { tool } => {
-                self.app.settings.tool = tool_from_dto(tool);
-                Vec::new()
+                if self.app.set_tool(tool_from_dto(tool)) {
+                    self.redraw = true;
+                    vec![self.state_event(false)]
+                } else {
+                    Vec::new()
+                }
             }
             Command::SetColor { rgba } => {
                 self.app.settings.color = Rgba::new(rgba[0], rgba[1], rgba[2], rgba[3]);
@@ -180,22 +199,31 @@ impl CanvasApp {
                 Vec::new()
             }
             Command::LayerAdd => {
+                self.app.clear_selection();
                 self.app.document.add_layer_above_active();
                 self.mark_dirty_and_redraw();
                 vec![self.state_event(true)]
             }
             Command::LayerRemove => {
+                let cleared = self.app.clear_selection();
                 if self.app.document.remove_active_layer() {
                     self.mark_dirty_and_redraw();
                     vec![self.state_event(true)]
+                } else if cleared {
+                    self.redraw = true;
+                    vec![self.state_event(false)]
                 } else {
                     Vec::new()
                 }
             }
             Command::LayerMove { up } => {
+                let cleared = self.app.clear_selection();
                 if self.app.document.move_active_layer(up) {
                     self.mark_dirty_and_redraw();
                     vec![self.state_event(true)]
+                } else if cleared {
+                    self.redraw = true;
+                    vec![self.state_event(false)]
                 } else {
                     Vec::new()
                 }
@@ -219,36 +247,82 @@ impl CanvasApp {
             }
             Command::LayerVisibility { index, visible } => {
                 if self.app.document.set_layer_visible(index, visible) {
+                    self.app.clear_selection();
                     self.redraw = true;
                     vec![self.state_event(false)]
                 } else {
                     Vec::new()
                 }
             }
-            Command::Undo => match self.app.undo() {
-                Some(result) => {
-                    // 撤回可能恢复一大片被擦掉的笔迹，直接整屏重绘最省心。
-                    self.mark_dirty_and_redraw();
-                    log::debug!(
-                        "撤回：图层 {}，{}",
-                        result.layer,
-                        if result.restored {
-                            "恢复被删笔迹"
+            Command::Undo => {
+                let had_selection = self.app.selection_len() > 0;
+                match self.app.undo() {
+                    Some(result) => {
+                        // 撤回可能恢复一大片被擦掉的笔迹，直接整屏重绘最省心。
+                        self.mark_dirty_and_redraw();
+                        self.cache.invalidate();
+                        log::debug!(
+                            "撤回：图层 {}，{}",
+                            result.layer,
+                            if result.restored {
+                                "恢复被删笔迹"
+                            } else {
+                                "删除最近一笔"
+                            }
+                        );
+                        vec![self.state_event(true)]
+                    }
+                    None => {
+                        log::debug!("撤回：没有可撤回的内容");
+                        if had_selection {
+                            self.redraw = true;
+                            vec![self.state_event(false)]
                         } else {
-                            "删除最近一笔"
+                            Vec::new()
                         }
-                    );
-                    vec![self.state_event(true)]
+                    }
                 }
-                None => {
-                    log::debug!("撤回：没有可撤回的内容");
-                    Vec::new()
-                }
-            },
+            }
             Command::ClearLayer => {
                 if self.app.clear_active_layer() {
                     self.redraw = true;
                     vec![self.state_event(true)]
+                } else {
+                    Vec::new()
+                }
+            }
+            Command::RecolorSelection { rgba } => {
+                let color = Rgba::new(rgba[0], rgba[1], rgba[2], rgba[3]);
+                if self.app.recolor_selection(color) {
+                    self.mark_dirty_and_redraw();
+                    self.cache.invalidate();
+                    vec![self.state_event(true)]
+                } else {
+                    Vec::new()
+                }
+            }
+            Command::ScaleSelection { factor } => {
+                if self.app.scale_selection(factor) {
+                    self.mark_dirty_and_redraw();
+                    self.cache.invalidate();
+                    vec![self.state_event(true)]
+                } else {
+                    Vec::new()
+                }
+            }
+            Command::MoveSelectionToLayer { index } => {
+                if self.app.move_selection_to_layer(index) {
+                    self.mark_dirty_and_redraw();
+                    self.cache.invalidate();
+                    vec![self.state_event(true)]
+                } else {
+                    Vec::new()
+                }
+            }
+            Command::ClearSelection => {
+                if self.app.clear_selection() {
+                    self.redraw = true;
+                    vec![self.state_event(false)]
                 } else {
                     Vec::new()
                 }
@@ -420,5 +494,7 @@ fn tool_from_dto(tool: ToolDto) -> Tool {
         ToolDto::Line => Tool::Line,
         ToolDto::Rect => Tool::Rect,
         ToolDto::Ellipse => Tool::Ellipse,
+        ToolDto::SelectRect => Tool::SelectRect,
+        ToolDto::SelectLasso => Tool::SelectLasso,
     }
 }

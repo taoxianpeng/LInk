@@ -14,7 +14,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 /// **改动 [`Command`] 或 [`Event`] 的变体时必须把它 +1**：面板与画布是两个可执行文件，
 /// 很容易出现"新面板配旧画布"（例如 `cargo run --release` 只重建了面板）。
 /// 版本号对不上时手会直接失败并给出明确提示，而不是像以前那样命令被静默丢弃。
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -24,6 +24,8 @@ pub enum ToolDto {
     Line,
     Rect,
     Ellipse,
+    SelectRect,
+    SelectLasso,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +82,16 @@ pub enum Command {
         visible: bool,
     },
     ClearLayer,
+    RecolorSelection {
+        rgba: [u8; 4],
+    },
+    ScaleSelection {
+        factor: f64,
+    },
+    MoveSelectionToLayer {
+        index: usize,
+    },
+    ClearSelection,
     /// 撤回上一步（Ctrl+Z）：删掉最近一笔，或恢复刚被擦掉/清空的笔迹。
     Undo,
     SetPassthrough {
@@ -111,6 +123,7 @@ pub enum Event {
         layers: Vec<LayerView>,
         active: usize,
         passthrough: bool,
+        selection: usize,
     },
     Device {
         name: String,
@@ -229,6 +242,12 @@ mod tests {
                 rgba: [12, 34, 56, 255],
             },
             Command::LayerMove { up: true },
+            Command::RecolorSelection {
+                rgba: [255, 0, 0, 255],
+            },
+            Command::ScaleSelection { factor: 1.1 },
+            Command::MoveSelectionToLayer { index: 2 },
+            Command::ClearSelection,
             Command::Undo,
             Command::ExportImage {
                 path: "/tmp/a.png".to_string(),
@@ -257,6 +276,7 @@ mod tests {
             }],
             active: 3,
             passthrough: false,
+            selection: 2,
         };
         let mut buffer = Vec::new();
         write_event(&mut buffer, &event).unwrap();

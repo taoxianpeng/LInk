@@ -1,6 +1,6 @@
 use link_ink::app::{App, Tool};
 use link_ink::input::{InputEvent, PointerSample, ToolKind};
-use link_ink::model::{Document, Point};
+use link_ink::model::{Document, Point, Rgba, Stroke};
 use link_ink::platform::{MonitorInfo, RectF, RectI};
 use link_ink::view::ViewTransform;
 
@@ -631,4 +631,301 @@ fn undoing_mid_stroke_discards_the_draft_only() {
         1,
         "已提交的那一笔不应被撤掉"
     );
+}
+
+fn selection_app(tool: Tool) -> (App, ViewTransform) {
+    let (view, mut document) = view_and_document();
+    document.layers[0].strokes = vec![
+        Stroke::constant(
+            Rgba::BLACK,
+            2.0,
+            vec![Point::new(100.0, 100.0), Point::new(180.0, 180.0)],
+        ),
+        Stroke::constant(
+            Rgba::BLACK,
+            2.0,
+            vec![Point::new(150.0, 200.0), Point::new(400.0, 300.0)],
+        ),
+    ];
+    let mut app = App::new(document);
+    app.set_tool(tool);
+    (app, view)
+}
+
+fn point_at(view: &ViewTransform, page: Point) -> PointerSample {
+    let (x, y) = view.page_to_logical(page);
+    mouse(x, y)
+}
+
+fn drag(app: &mut App, view: &ViewTransform, from: Point, to: Point) {
+    app.handle_input(InputEvent::Down(point_at(view, from)), view);
+    app.handle_input(InputEvent::Move(point_at(view, to)), view);
+    app.handle_input(InputEvent::Up(point_at(view, to)), view);
+}
+
+#[test]
+fn rect_marquee_highlights_candidates_live_and_commits_selection() {
+    let (mut app, view) = selection_app(Tool::SelectRect);
+
+    app.handle_input(
+        InputEvent::Down(point_at(&view, Point::new(50.0, 50.0))),
+        &view,
+    );
+    app.handle_input(
+        InputEvent::Move(point_at(&view, Point::new(260.0, 260.0))),
+        &view,
+    );
+    assert_eq!(app.overlay_strokes().len(), 1, "拖动中应实时高亮候选笔迹");
+    assert_eq!(app.selection_len(), 0, "松开前尚未提交选择");
+
+    app.handle_input(
+        InputEvent::Up(point_at(&view, Point::new(260.0, 260.0))),
+        &view,
+    );
+    assert_eq!(app.selection_len(), 1);
+    assert_eq!(app.document.active_layer().strokes.len(), 2);
+}
+
+#[test]
+fn lasso_marquee_selects_fully_contained_strokes() {
+    let (mut app, view) = selection_app(Tool::SelectLasso);
+    let path = [
+        Point::new(50.0, 50.0),
+        Point::new(50.0, 260.0),
+        Point::new(260.0, 260.0),
+        Point::new(260.0, 50.0),
+        Point::new(50.0, 50.0),
+    ];
+    app.handle_input(InputEvent::Down(point_at(&view, path[0])), &view);
+    for point in &path[1..] {
+        app.handle_input(InputEvent::Move(point_at(&view, *point)), &view);
+    }
+    assert_eq!(app.overlay_strokes().len(), 1, "套索拖动中应实时高亮");
+    app.handle_input(InputEvent::Up(point_at(&view, path[4])), &view);
+    assert_eq!(app.selection_len(), 1);
+}
+
+#[test]
+fn clicking_empty_canvas_clears_selection() {
+    let (mut app, view) = selection_app(Tool::SelectRect);
+    drag(
+        &mut app,
+        &view,
+        Point::new(50.0, 50.0),
+        Point::new(260.0, 260.0),
+    );
+    assert_eq!(app.selection_len(), 1);
+
+    drag(
+        &mut app,
+        &view,
+        Point::new(500.0, 500.0),
+        Point::new(520.0, 520.0),
+    );
+    assert_eq!(app.selection_len(), 0);
+}
+
+#[test]
+fn dragging_selected_strokes_moves_them_and_undo_restores() {
+    let (mut app, view) = selection_app(Tool::SelectRect);
+    drag(
+        &mut app,
+        &view,
+        Point::new(50.0, 50.0),
+        Point::new(260.0, 260.0),
+    );
+    let original = app.document.active_layer().strokes[0].clone();
+
+    app.handle_input(
+        InputEvent::Down(point_at(&view, Point::new(120.0, 120.0))),
+        &view,
+    );
+    app.handle_input(
+        InputEvent::Move(point_at(&view, Point::new(170.0, 150.0))),
+        &view,
+    );
+    assert_eq!(
+        app.document.active_layer().strokes.len(),
+        1,
+        "拖动期间选中笔迹应从文档临时提起"
+    );
+    app.handle_input(
+        InputEvent::Up(point_at(&view, Point::new(170.0, 150.0))),
+        &view,
+    );
+
+    let moved = &app.document.active_layer().strokes[0];
+    assert_eq!(moved.points[0], Point::new(150.0, 130.0));
+    assert_eq!(moved.points[1], Point::new(230.0, 210.0));
+    assert_eq!(app.selection_len(), 1, "移动后保持选中");
+
+    app.undo().expect("移动应可撤回");
+    assert_eq!(app.document.active_layer().strokes[0], original);
+    assert_eq!(app.selection_len(), 0, "撤回后清空选择");
+}
+
+#[test]
+fn dragging_edge_scales_selection_proportionally() {
+    let (mut app, view) = selection_app(Tool::SelectRect);
+    drag(
+        &mut app,
+        &view,
+        Point::new(50.0, 50.0),
+        Point::new(260.0, 260.0),
+    );
+    let original = app.selection_bounds().expect("选区包围盒");
+    let center_y = (original.1 + original.3) / 2.0;
+
+    app.handle_input(
+        InputEvent::Down(point_at(&view, Point::new(original.2, center_y))),
+        &view,
+    );
+    app.handle_input(
+        InputEvent::Move(point_at(&view, Point::new(220.0, center_y))),
+        &view,
+    );
+    app.handle_input(
+        InputEvent::Up(point_at(&view, Point::new(220.0, center_y))),
+        &view,
+    );
+
+    let scaled = app.selection_bounds().expect("缩放后包围盒");
+    assert!(
+        scaled.2 - scaled.0 > original.2 - original.0,
+        "拖右边应等比放大选区"
+    );
+    assert!(
+        ((scaled.1 + scaled.3) - (original.1 + original.3)).abs() < 1.0,
+        "缩放应围绕选区中心"
+    );
+
+    app.undo().expect("缩放应可撤回");
+    let restored = app.document.active_layer().strokes[0].bounds_pt();
+    assert!((restored.0 - 98.0).abs() < 0.01 && (restored.2 - 182.0).abs() < 0.01);
+}
+
+#[test]
+fn dragging_corner_rotates_selection() {
+    let (mut app, view) = selection_app(Tool::SelectRect);
+    drag(
+        &mut app,
+        &view,
+        Point::new(50.0, 50.0),
+        Point::new(260.0, 260.0),
+    );
+    let bounds = app.selection_bounds().expect("选区包围盒");
+    let center = Point::new((bounds.0 + bounds.2) / 2.0, (bounds.1 + bounds.3) / 2.0);
+
+    app.handle_input(
+        InputEvent::Down(point_at(&view, Point::new(bounds.2, bounds.3))),
+        &view,
+    );
+    app.handle_input(
+        InputEvent::Move(point_at(&view, Point::new(center.x + 60.0, center.y))),
+        &view,
+    );
+    app.handle_input(
+        InputEvent::Up(point_at(&view, Point::new(center.x + 60.0, center.y))),
+        &view,
+    );
+
+    let stroke = &app.document.active_layer().strokes[0];
+    assert!(
+        (stroke.points[0].y - center.y).abs() < 1.0 && (stroke.points[1].y - center.y).abs() < 1.0,
+        "拖角手柄应旋转笔迹"
+    );
+
+    app.undo().expect("旋转应可撤回");
+    assert_eq!(
+        app.document.active_layer().strokes[0].points[0],
+        Point::new(100.0, 100.0)
+    );
+}
+
+#[test]
+fn scaled_selection_scales_points_and_widths() {
+    let (mut app, view) = selection_app(Tool::SelectRect);
+    drag(
+        &mut app,
+        &view,
+        Point::new(50.0, 50.0),
+        Point::new(260.0, 260.0),
+    );
+    let bounds = app.selection_bounds().expect("应有选区包围盒");
+    let center = Point::new((bounds.0 + bounds.2) / 2.0, (bounds.1 + bounds.3) / 2.0);
+
+    assert!(app.scale_selection(2.0));
+    let stroke = &app.document.active_layer().strokes[0];
+    let expected = [
+        Point::new(
+            center.x + (100.0 - center.x) * 2.0,
+            center.y + (100.0 - center.y) * 2.0,
+        ),
+        Point::new(
+            center.x + (180.0 - center.x) * 2.0,
+            center.y + (180.0 - center.y) * 2.0,
+        ),
+    ];
+    assert_eq!(stroke.points, expected);
+    assert_eq!(stroke.base_width_pt, 4.0);
+
+    app.undo().expect("缩放应可撤回");
+    assert_eq!(app.document.active_layer().strokes[0].base_width_pt, 2.0);
+}
+
+#[test]
+fn recoloring_selection_only_affects_selected_strokes() {
+    let (mut app, view) = selection_app(Tool::SelectRect);
+    drag(
+        &mut app,
+        &view,
+        Point::new(50.0, 50.0),
+        Point::new(260.0, 260.0),
+    );
+    let red = Rgba::new(255, 0, 0, 255);
+    assert!(app.recolor_selection(red));
+
+    let strokes = &app.document.active_layer().strokes;
+    assert_eq!(strokes[0].color, red);
+    assert_eq!(strokes[1].color, Rgba::BLACK);
+
+    app.undo().expect("改色应可撤回");
+    assert_eq!(app.document.active_layer().strokes[0].color, Rgba::BLACK);
+}
+
+#[test]
+fn moving_selection_to_another_layer_can_be_undone() {
+    let (mut app, view) = selection_app(Tool::SelectRect);
+    app.document.add_layer_above_active();
+    app.document.active = 0;
+    drag(
+        &mut app,
+        &view,
+        Point::new(50.0, 50.0),
+        Point::new(260.0, 260.0),
+    );
+
+    assert!(app.move_selection_to_layer(1));
+    assert_eq!(app.document.layers[0].strokes.len(), 1);
+    assert_eq!(app.document.layers[1].strokes.len(), 1);
+    assert_eq!(app.selection_len(), 1);
+
+    app.undo().expect("移动图层应可撤回");
+    assert_eq!(app.document.layers[1].strokes.len(), 0);
+    assert_eq!(app.document.layers[0].strokes.len(), 2);
+    assert_eq!(app.selection_len(), 0);
+}
+
+#[test]
+fn switching_tools_clears_selection() {
+    let (mut app, view) = selection_app(Tool::SelectRect);
+    drag(
+        &mut app,
+        &view,
+        Point::new(50.0, 50.0),
+        Point::new(260.0, 260.0),
+    );
+    assert_eq!(app.selection_len(), 1);
+    app.set_tool(Tool::Line);
+    assert_eq!(app.selection_len(), 0);
 }

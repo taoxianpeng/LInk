@@ -72,6 +72,16 @@ pub fn draw(
             let _ = render::draw_stroke(cr, draft, view);
             let _ = render::draw_layers_above(cr, &app.document, active, view, cull_pt);
         }
+        let selection = app.overlay_strokes();
+        if !selection.is_empty() {
+            let _ = render::draw_selection(cr, &selection, view, app.selection_transform());
+        }
+        if let Some(bounds) = app.selection_box() {
+            let _ = render::draw_selection_box(cr, bounds, app.selection_transform(), view);
+        }
+        if let Some((kind, start, current, points)) = app.marquee_view() {
+            let _ = render::draw_marquee(cr, kind, start, current, points, view);
+        }
     };
 
     if area > ATOMIC_COMPOSE_MAX_AREA {
