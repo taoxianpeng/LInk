@@ -115,8 +115,8 @@ struct PanelApp {
     pending: Option<PendingPick>,
     /// 需要把面板提到画布之上（画布是全屏置顶窗口，会盖住面板）。
     raise_at: Option<Instant>,
-    /// 本面板窗口的 X11 window id（仅 Linux 使用）。
-    x11_window: Option<u32>,
+    /// 本面板窗口的原生句柄（Linux 是 X11 window id，Windows 是 HWND）。
+    native_window: Option<isize>,
 }
 
 impl PanelApp {
@@ -155,7 +155,7 @@ impl PanelApp {
             start: Instant::now(),
             pending: None,
             raise_at: None,
-            x11_window: x11_window_id(cc),
+            native_window: native_window_id(cc),
         }
     }
 
@@ -234,8 +234,10 @@ impl PanelApp {
             }
             Action::Quit => {
                 self.save_settings_now();
-                self.send(Command::Quit);
-                std::process::exit(0);
+                // 先显式关掉画布（kill + wait），再走 eframe 的正常关闭流程。
+                // `std::process::exit` 会跳过所有 Drop，画布可能变成孤儿进程。
+                self.client.take();
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
     }
@@ -475,15 +477,31 @@ fn decode_thumbnail(
 }
 
 fn install_fonts(ctx: &egui::Context) {
-    // 中文回退：优先用系统里能直接解析的 TTF（TTC 集合某些后端解析不了）。
-    const CANDIDATES: &[&str] = &[
-        "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
-        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttf",
-        "C:/Windows/Fonts/msyh.ttc",
-        "C:/Windows/Fonts/simhei.ttf",
-    ];
-    for path in CANDIDATES {
-        let Ok(bytes) = std::fs::read(path) else {
+    // 中文回退：egui 0.37 用 skrifa 解析，TTC（含 msyh.ttc）可以正常加载。
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    #[cfg(target_os = "windows")]
+    {
+        let font_dir = std::env::var_os("WINDIR")
+            .map(std::path::PathBuf::from)
+            .map(|dir| dir.join("Fonts"))
+            .unwrap_or_else(|| std::path::PathBuf::from("C:/Windows/Fonts"));
+        for name in ["msyh.ttc", "msyhl.ttc", "simhei.ttf", "simsun.ttc"] {
+            candidates.push(font_dir.join(name));
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        for path in [
+            "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttf",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        ] {
+            candidates.push(std::path::PathBuf::from(path));
+        }
+    }
+
+    for path in candidates {
+        let Ok(bytes) = std::fs::read(&path) else {
             continue;
         };
         let mut fonts = egui::FontDefinitions::default();
@@ -499,7 +517,7 @@ fn install_fonts(ctx: &egui::Context) {
                 .push("cjk".to_string());
         }
         ctx.set_fonts(fonts);
-        log::info!("中文回退字体：{path}");
+        log::info!("中文回退字体：{}", path.display());
         return;
     }
     log::warn!("没找到中文回退字体，中文可能显示为方框");
@@ -534,7 +552,22 @@ fn install_style(ctx: &egui::Context) {
 
 impl eframe::App for PanelApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        [0.0, 0.0, 0.0, 0.0]
+        // Linux 靠窗口透明 + 圆角面板；Windows 的 WGL 透明度不稳定，
+        // 直接用不透明底色，避免圆角处出现黑边。
+        #[cfg(target_os = "windows")]
+        {
+            let bg = PANEL_BG;
+            [
+                bg.r() as f32 / 255.0,
+                bg.g() as f32 / 255.0,
+                bg.b() as f32 / 255.0,
+                1.0,
+            ]
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            [0.0, 0.0, 0.0, 0.0]
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -582,7 +615,10 @@ impl eframe::App for PanelApp {
 }
 
 impl PanelApp {
-    /// 面板高度跟随内容，避免图层少时留下大块空白。
+    /// 面板高度跟随内容（`content_bottom` 是逻辑点），避免图层少时留下大块空白。
+    ///
+    /// `ViewportCommand::InnerSize` 的单位是逻辑点，winit 会按当前 DPI 换算成物理像素；
+    /// 这里比较的也是 `content_rect` 的逻辑尺寸，两边单位一致。
     fn fit_height(&self, ctx: &egui::Context, content_bottom: f32) {
         if !content_bottom.is_finite() || content_bottom <= 0.0 {
             return;
@@ -591,13 +627,13 @@ impl PanelApp {
         let desired = (content_bottom - screen.top() + 10.0)
             .ceil()
             .clamp(PANEL_MIN_HEIGHT, PANEL_MAX_HEIGHT);
-        if (desired - screen.height()).abs() > 1.0 {
+        // 留 2pt 容差：非整数 DPI（1.25/1.5/1.75）下取整会造成 0.5px 抖动死循环。
+        if (desired - screen.height()).abs() > 2.0 {
             log::debug!("调整面板高度：{:.1} -> {desired:.1}", screen.height());
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(
                 screen.width().max(PANEL_WIDTH),
                 desired,
             )));
-            ctx.request_repaint();
         }
     }
 
@@ -608,7 +644,7 @@ impl PanelApp {
             return;
         };
         if Instant::now() >= at {
-            if let Some(window) = self.x11_window {
+            if let Some(window) = self.native_window {
                 raise_window(window);
             }
             log::info!("把面板提到画布之上");
@@ -1353,19 +1389,28 @@ impl PanelApp {
     }
 }
 
-/// 取本窗口的 X11 id（winit 在 Linux 上用 Xlib/Xcb 窗口）。
+/// 取本窗口的原生句柄。
 #[cfg(all(unix, not(target_os = "macos")))]
-fn x11_window_id(cc: &eframe::CreationContext<'_>) -> Option<u32> {
+fn native_window_id(cc: &eframe::CreationContext<'_>) -> Option<isize> {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     match cc.window_handle().ok()?.as_raw() {
-        RawWindowHandle::Xlib(handle) => Some(handle.window as u32),
-        RawWindowHandle::Xcb(handle) => Some(handle.window.get()),
+        RawWindowHandle::Xlib(handle) => Some(handle.window as isize),
+        RawWindowHandle::Xcb(handle) => Some(handle.window.get() as isize),
         _ => None,
     }
 }
 
-#[cfg(not(all(unix, not(target_os = "macos"))))]
-fn x11_window_id(_cc: &eframe::CreationContext<'_>) -> Option<u32> {
+#[cfg(target_os = "windows")]
+fn native_window_id(cc: &eframe::CreationContext<'_>) -> Option<isize> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    match cc.window_handle().ok()?.as_raw() {
+        RawWindowHandle::Win32(handle) => Some(handle.hwnd.get() as isize),
+        _ => None,
+    }
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
+fn native_window_id(_cc: &eframe::CreationContext<'_>) -> Option<isize> {
     None
 }
 
@@ -1374,12 +1419,12 @@ fn x11_window_id(_cc: &eframe::CreationContext<'_>) -> Option<u32> {
 /// `ViewportCommand::Focus` 只改焦点，窗口管理器不会因此重排两个“置顶”窗口，
 /// 而画布是后创建的全屏置顶窗口，会盖住面板、吞掉点击。
 #[cfg(all(unix, not(target_os = "macos")))]
-fn raise_window(window: u32) {
+fn raise_window(window: isize) {
     use x11rb::connection::Connection;
     use x11rb::protocol::xproto::{ConfigureWindowAux, ConnectionExt as _, StackMode};
     if let Ok((connection, screen)) = x11rb::connect(None) {
         let aux = ConfigureWindowAux::new().stack_mode(StackMode::ABOVE);
-        if let Err(error) = connection.configure_window(window, &aux) {
+        if let Err(error) = connection.configure_window(window as u32, &aux) {
             log::warn!("抬升面板窗口失败: {error}");
         }
         let _ = connection.flush();
@@ -1387,8 +1432,31 @@ fn raise_window(window: u32) {
     }
 }
 
-#[cfg(not(all(unix, not(target_os = "macos"))))]
-fn raise_window(_window: u32) {}
+/// Windows：两个同为 topmost 的窗口不会自动重排，需要显式再置顶一次。
+#[cfg(target_os = "windows")]
+fn raise_window(hwnd: isize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SetWindowPos, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
+    };
+    let hwnd = hwnd as windows_sys::Win32::Foundation::HWND;
+    let ok = unsafe {
+        SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        )
+    };
+    if ok == 0 {
+        log::warn!("抬升面板窗口失败：{}", std::io::Error::last_os_error());
+    }
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
+fn raise_window(_window: isize) {}
 
 /// 固定宽度的字段名，保证滑杆左端对齐。
 fn field_label(ui: &mut egui::Ui, text: &str) {
@@ -1408,19 +1476,40 @@ fn separator(ui: &mut egui::Ui) {
     ui.add_space(6.0);
 }
 
+#[cfg(target_os = "windows")]
+fn enable_dpi_awareness() {
+    // 必须在创建 winit 事件循环/窗口之前调用。winit 自己也会设，但如果进程清单里
+    // 没有 DPI 感知声明，它可能拿到 scale_factor = 1.0，导致窗口物理尺寸只有
+    // 逻辑尺寸那么大（内容被裁掉）。
+    const PER_MONITOR_AWARE_V2: *mut std::ffi::c_void = (-4isize) as *mut std::ffi::c_void;
+    let ok = unsafe {
+        windows_sys::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)
+    };
+    if ok == 0 {
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::SetProcessDPIAware();
+        }
+    }
+}
+
 fn main() -> eframe::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    #[cfg(target_os = "windows")]
+    enable_dpi_awareness();
 
+    let viewport = egui::ViewportBuilder::default()
+        .with_inner_size([PANEL_WIDTH, 340.0])
+        .with_min_inner_size([PANEL_WIDTH, PANEL_MIN_HEIGHT])
+        .with_max_inner_size([PANEL_WIDTH, PANEL_MAX_HEIGHT])
+        .with_resizable(true)
+        .with_decorations(false)
+        .with_always_on_top()
+        .with_title("LInk");
+    // Windows 的 WGL 透明合成不可靠（见 clear_color 注释），只在不透明模式下运行。
+    #[cfg(not(target_os = "windows"))]
+    let viewport = viewport.with_transparent(true);
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([PANEL_WIDTH, 340.0])
-            .with_min_inner_size([PANEL_WIDTH, PANEL_MIN_HEIGHT])
-            .with_max_inner_size([PANEL_WIDTH, PANEL_MAX_HEIGHT])
-            .with_resizable(true)
-            .with_decorations(false)
-            .with_transparent(true)
-            .with_always_on_top()
-            .with_title("LInk"),
+        viewport,
         ..Default::default()
     };
 

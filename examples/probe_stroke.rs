@@ -4,8 +4,8 @@
 
 use std::path::PathBuf;
 
-use cairo::{Context, Format, ImageSurface, LineCap, LineJoin};
 use link_ink::model::{Point, Rgba, Stroke};
+use link_ink::paint::{Cap, Color, Join, PathBuilder2, Surface};
 use link_ink::platform::{MonitorInfo, RectF, RectI};
 use link_ink::render::draw_stroke;
 use link_ink::view::ViewTransform;
@@ -124,66 +124,54 @@ fn view(monitor: &MonitorInfo) -> ViewTransform {
         .to_physical_pixels(ZOOM)
 }
 
-fn canvas(monitor: &MonitorInfo) -> ImageSurface {
-    let width = (monitor.logical.width * ZOOM) as i32;
-    let height = (monitor.logical.height * ZOOM) as i32;
-    let surface = ImageSurface::create(Format::ARgb32, width, height).unwrap();
-    {
-        let cr = Context::new(&surface).unwrap();
-        cr.set_source_rgb(1.0, 1.0, 1.0);
-        cr.paint().unwrap();
-    }
+fn canvas(monitor: &MonitorInfo) -> Box<dyn Surface> {
+    let width = (monitor.logical.width * ZOOM) as u32;
+    let height = (monitor.logical.height * ZOOM) as u32;
+    let mut surface = link_ink::paint::new_surface(width, height).unwrap();
+    surface.fill(Color::WHITE);
     surface
 }
 
 fn save(path: &PathBuf, stroke: &Stroke, monitor: &MonitorInfo) {
     let mut surface = canvas(monitor);
     let view = view(monitor);
-    {
-        let cr = Context::new(&surface).unwrap();
-        draw_stroke(&cr, stroke, &view).unwrap();
-    }
-    write_png(&mut surface, path);
+    surface.with_canvas(&mut |canvas| draw_stroke(canvas, stroke, &view));
+    write_png(surface.as_mut(), path);
 }
 
+/// 不经过平滑/变宽轮廓，直接用后端描一条折线，作为“原始几何”的参照。
 fn save_reference(path: &PathBuf, points: &[Point], width_pt: f64, monitor: &MonitorInfo) {
     let mut surface = canvas(monitor);
     let view = view(monitor);
-    let cr = Context::new(&surface).unwrap();
-    let (origin_x, origin_y) = view.origin_logical();
-    cr.translate(origin_x, origin_y);
-    cr.scale(view.pt_to_logical(), view.pt_to_logical());
-    cr.set_line_cap(LineCap::Round);
-    cr.set_line_join(LineJoin::Round);
-    cr.set_line_width(width_pt);
-    cr.set_source_rgb(0.0, 0.0, 0.0);
-    cr.move_to(points[0].x, points[0].y);
-    for point in &points[1..] {
-        cr.line_to(point.x, point.y);
-    }
-    cr.stroke().unwrap();
-    drop(cr);
-    write_png(&mut surface, path);
+    surface.with_canvas(&mut |canvas| {
+        let (origin_x, origin_y) = view.origin_logical();
+        canvas.translate(origin_x, origin_y);
+        canvas.scale(view.pt_to_logical(), view.pt_to_logical());
+        canvas.set_line_cap(Cap::Round);
+        canvas.set_line_join(Join::Round);
+        canvas.set_line_width(width_pt);
+        canvas.set_color(Color::new(0, 0, 0, 255));
+        let mut builder = PathBuilder2::new();
+        builder.move_to(points[0].x, points[0].y);
+        for point in &points[1..] {
+            builder.line_to(point.x, point.y);
+        }
+        if let Some(path) = builder.finish() {
+            canvas.stroke_path(&path);
+        }
+    });
+    write_png(surface.as_mut(), path);
 }
 
-fn write_png(surface: &mut ImageSurface, path: &PathBuf) {
+fn write_png(surface: &mut dyn Surface, path: &PathBuf) {
     let width = surface.width();
     let height = surface.height();
-    let stride = surface.stride() as usize;
-    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
-    {
-        let data = surface.data().unwrap();
-        for row in data.chunks_exact(stride).take(height as usize) {
-            for pixel in row[..width as usize * 4].chunks_exact(4) {
-                rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 255]);
-            }
-        }
-    }
+    let rgba = surface.read_rgba();
     image::save_buffer(
         path,
         &rgba,
-        width as u32,
-        height as u32,
+        width,
+        height,
         image::ColorType::Rgba8,
     )
     .unwrap();

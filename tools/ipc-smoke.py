@@ -8,10 +8,11 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 
 BINARY = sys.argv[1] if len(sys.argv) > 1 else "target/debug/link-ink-canvas"
-PROTO = 1
+PROTO = 3
 
 
 class Canvas:
@@ -94,7 +95,7 @@ def main():
         assert state["layers"][0]["visible"] is False, state["layers"]
         print("✓ 可见性切换生效")
 
-        out = "/tmp/link-ipc-smoke.png"
+        out = os.path.join(tempfile.gettempdir(), "link-ipc-smoke.png")
         if os.path.exists(out):
             os.remove(out)
         canvas.send(

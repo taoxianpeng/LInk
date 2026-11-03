@@ -1,8 +1,7 @@
 use std::f64::consts::PI;
 
-use cairo::{Context, LineCap, LineJoin};
-
 use crate::model::{Document, Layer, Point, Stroke};
+use crate::paint::{Canvas, Cap, Color, Join, Path2, PathBuilder2, RectF};
 use crate::selection::{MarqueeKind, Rect, SelectionTransform};
 use crate::view::ViewTransform;
 
@@ -15,20 +14,20 @@ const SMOOTH_MAX_STEP_PT: f64 = 1.5;
 /// 平滑后的点数上限，避免极长笔迹把每帧成本拉爆。
 const SMOOTH_MAX_POINTS: usize = 24_000;
 
-pub fn draw_document(cr: &Context, document: &Document, view: &ViewTransform) -> cairo::Result<()> {
-    cr.save()?;
-    apply_transform(cr, view)?;
-    cr.set_line_cap(LineCap::Round);
-    cr.set_line_join(LineJoin::Round);
+pub fn draw_document(canvas: &mut dyn Canvas, document: &Document, view: &ViewTransform) {
+    canvas.save();
+    apply_transform(canvas, view);
+    canvas.set_line_cap(Cap::Round);
+    canvas.set_line_join(Join::Round);
     for layer in &document.layers {
         if !layer.visible {
             continue;
         }
         for stroke in &layer.strokes {
-            paint_stroke(cr, stroke)?;
+            paint_stroke(canvas, stroke);
         }
     }
-    cr.restore()
+    canvas.restore();
 }
 
 /// 只画 `layer_index` **之上**的那些图层的笔迹。
@@ -39,20 +38,20 @@ pub fn draw_document(cr: &Context, document: &Document, view: &ViewTransform) ->
 /// `cull_pt` 是本帧要重绘的页面区域，包围盒不相交的笔迹直接跳过 —— 这条路径每帧都会走，
 /// 上层笔迹多时靠它把成本压在一小块区域内。
 pub fn draw_layers_above(
-    cr: &Context,
+    canvas: &mut dyn Canvas,
     document: &Document,
     layer_index: usize,
     view: &ViewTransform,
     cull_pt: Option<(f64, f64, f64, f64)>,
-) -> cairo::Result<()> {
+) {
     let above = document.layers.len().saturating_sub(layer_index + 1);
     if above == 0 {
-        return Ok(());
+        return;
     }
-    cr.save()?;
-    apply_transform(cr, view)?;
-    cr.set_line_cap(LineCap::Round);
-    cr.set_line_join(LineJoin::Round);
+    canvas.save();
+    apply_transform(canvas, view);
+    canvas.set_line_cap(Cap::Round);
+    canvas.set_line_join(Join::Round);
     for layer in &document.layers[layer_index + 1..] {
         if !layer.visible {
             continue;
@@ -63,78 +62,83 @@ pub fn draw_layers_above(
                     continue;
                 }
             }
-            paint_stroke(cr, stroke)?;
+            paint_stroke(canvas, stroke);
         }
     }
-    cr.restore()
+    canvas.restore();
 }
 
 fn rects_overlap(a: (f64, f64, f64, f64), b: (f64, f64, f64, f64)) -> bool {
     a.0 <= b.2 && b.0 <= a.2 && a.1 <= b.3 && b.1 <= a.3
 }
 
-pub fn draw_stroke(cr: &Context, stroke: &Stroke, view: &ViewTransform) -> cairo::Result<()> {
-    cr.save()?;
-    apply_transform(cr, view)?;
-    cr.set_line_cap(LineCap::Round);
-    cr.set_line_join(LineJoin::Round);
-    paint_stroke(cr, stroke)?;
-    cr.restore()
+pub fn draw_stroke(canvas: &mut dyn Canvas, stroke: &Stroke, view: &ViewTransform) {
+    canvas.save();
+    apply_transform(canvas, view);
+    canvas.set_line_cap(Cap::Round);
+    canvas.set_line_join(Join::Round);
+    paint_stroke(canvas, stroke);
+    canvas.restore();
 }
 
-pub fn draw_layer(cr: &Context, layer: &Layer, view: &ViewTransform) -> cairo::Result<()> {
-    cr.save()?;
-    apply_transform(cr, view)?;
-    cr.set_line_cap(LineCap::Round);
-    cr.set_line_join(LineJoin::Round);
+pub fn draw_layer(canvas: &mut dyn Canvas, layer: &Layer, view: &ViewTransform) {
+    canvas.save();
+    apply_transform(canvas, view);
+    canvas.set_line_cap(Cap::Round);
+    canvas.set_line_join(Join::Round);
     for stroke in &layer.strokes {
-        paint_stroke(cr, stroke)?;
+        paint_stroke(canvas, stroke);
     }
-    cr.restore()
+    canvas.restore();
 }
 
 pub fn draw_selection(
-    cr: &Context,
+    canvas: &mut dyn Canvas,
     strokes: &[&Stroke],
     view: &ViewTransform,
     transform: SelectionTransform,
-) -> cairo::Result<()> {
-    cr.save()?;
-    apply_transform(cr, view)?;
-    apply_selection_transform(cr, transform);
+) {
+    canvas.save();
+    apply_transform(canvas, view);
+    apply_selection_transform(canvas, transform);
     let scale = view.pt_to_logical().max(1e-6);
-    cr.set_dash(&[5.0 / scale, 4.0 / scale], 0.0);
-    cr.set_line_cap(LineCap::Round);
-    cr.set_line_join(LineJoin::Round);
+    canvas.set_dash(&[5.0 / scale, 4.0 / scale], 0.0);
+    canvas.set_line_cap(Cap::Round);
+    canvas.set_line_join(Join::Round);
     for stroke in strokes {
-        if !build_selection_edge_path(cr, stroke) {
+        let Some(path) = build_selection_edge_path(stroke) else {
             continue;
-        }
-        cr.set_source_rgba(SELECTION_HALO.0, SELECTION_HALO.1, SELECTION_HALO.2, 0.85);
-        cr.set_line_width(2.4 / scale);
-        cr.stroke_preserve()?;
-        cr.set_source_rgba(
+        };
+        canvas.set_color(rgba(
+            SELECTION_HALO.0,
+            SELECTION_HALO.1,
+            SELECTION_HALO.2,
+            0.85,
+        ));
+        canvas.set_line_width(2.4 / scale);
+        canvas.stroke_path(&path);
+        canvas.set_color(rgba(
             SELECTION_COLOR.0,
             SELECTION_COLOR.1,
             SELECTION_COLOR.2,
             0.95,
-        );
-        cr.set_line_width(1.3 / scale);
-        cr.stroke()?;
+        ));
+        canvas.set_line_width(1.3 / scale);
+        canvas.stroke_path(&path);
     }
-    cr.set_dash(&[], 0.0);
-    cr.restore()
+    canvas.set_dash(&[], 0.0);
+    canvas.restore();
 }
 
 pub fn draw_selection_box(
-    cr: &Context,
+    canvas: &mut dyn Canvas,
     bounds: Rect,
     transform: SelectionTransform,
     view: &ViewTransform,
-) -> cairo::Result<()> {
-    cr.save()?;
-    apply_transform(cr, view)?;
-    apply_selection_transform(cr, transform);
+) {
+    canvas.save();
+    apply_transform(canvas, view);
+    apply_selection_transform(canvas, transform);
     let scale = view.pt_to_logical().max(1e-6);
     let corners = [
         Point::new(bounds.0, bounds.1),
@@ -142,20 +146,22 @@ pub fn draw_selection_box(
         Point::new(bounds.2, bounds.3),
         Point::new(bounds.0, bounds.3),
     ];
-    cr.set_source_rgba(
+    canvas.set_color(rgba(
         SELECTION_COLOR.0,
         SELECTION_COLOR.1,
         SELECTION_COLOR.2,
         0.95,
-    );
-    cr.set_line_width(1.0 / scale);
-    cr.new_path();
-    cr.move_to(corners[0].x, corners[0].y);
+    ));
+    canvas.set_line_width(1.0 / scale);
+    let mut outline = PathBuilder2::new();
+    outline.move_to(corners[0].x, corners[0].y);
     for point in &corners[1..] {
-        cr.line_to(point.x, point.y);
+        outline.line_to(point.x, point.y);
     }
-    cr.close_path();
-    cr.stroke()?;
+    outline.close();
+    if let Some(outline) = outline.finish() {
+        canvas.stroke_path(&outline);
+    }
 
     let half = 3.0 / scale;
     let mut handles = Vec::with_capacity(8);
@@ -166,188 +172,198 @@ pub fn draw_selection_box(
         handles.push(Point::new((a.x + b.x) / 2.0, (a.y + b.y) / 2.0));
     }
     for point in handles {
-        cr.rectangle(point.x - half, point.y - half, half * 2.0, half * 2.0);
-        cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
-        cr.fill_preserve()?;
-        cr.set_source_rgba(SELECTION_COLOR.0, SELECTION_COLOR.1, SELECTION_COLOR.2, 1.0);
-        cr.set_line_width(1.0 / scale);
-        cr.stroke()?;
+        let mut handle = PathBuilder2::new();
+        handle.rect(point.x - half, point.y - half, half * 2.0, half * 2.0);
+        let Some(handle) = handle.finish() else {
+            continue;
+        };
+        canvas.set_color(Color::WHITE);
+        canvas.fill_path(&handle);
+        canvas.set_color(rgba(
+            SELECTION_COLOR.0,
+            SELECTION_COLOR.1,
+            SELECTION_COLOR.2,
+            1.0,
+        ));
+        canvas.set_line_width(1.0 / scale);
+        canvas.stroke_path(&handle);
     }
-    cr.restore()
+    canvas.restore();
 }
 
-fn apply_selection_transform(cr: &Context, transform: SelectionTransform) {
+fn apply_selection_transform(canvas: &mut dyn Canvas, transform: SelectionTransform) {
     match transform {
         SelectionTransform::None => {}
-        SelectionTransform::Move { dx, dy } => cr.translate(dx, dy),
+        SelectionTransform::Move { dx, dy } => canvas.translate(dx, dy),
         SelectionTransform::Scale { center, factor } => {
-            cr.translate(center.x, center.y);
-            cr.scale(factor, factor);
-            cr.translate(-center.x, -center.y);
+            canvas.translate(center.x, center.y);
+            canvas.scale(factor, factor);
+            canvas.translate(-center.x, -center.y);
         }
         SelectionTransform::Rotate { center, radians } => {
-            cr.translate(center.x, center.y);
-            cr.rotate(radians);
-            cr.translate(-center.x, -center.y);
+            canvas.translate(center.x, center.y);
+            canvas.rotate(radians);
+            canvas.translate(-center.x, -center.y);
         }
     }
 }
 
-fn build_selection_edge_path(cr: &Context, stroke: &Stroke) -> bool {
+fn build_selection_edge_path(stroke: &Stroke) -> Option<Path2> {
     match stroke.points.as_slice() {
-        [] => false,
+        [] => None,
         [point] => {
-            cr.new_sub_path();
-            cr.arc(
+            let mut builder = PathBuilder2::new();
+            builder.circle(
                 point.x,
                 point.y,
                 stroke.width_at(0).max(0.05) / 2.0 + 0.5,
-                0.0,
-                2.0 * PI,
             );
-            true
+            builder.finish()
         }
         _ => {
+            let mut builder = PathBuilder2::new();
             if stroke.widths_pt.is_some() {
                 let widths: Vec<f64> = (0..stroke.points.len())
                     .map(|index| stroke.width_at(index))
                     .collect();
                 let (points, widths) = smooth_polyline(&stroke.points, &widths);
-                build_outline_path(cr, &points, &widths, 0.5);
+                build_outline_path(&mut builder, &points, &widths, 0.5);
             } else {
                 let widths = vec![stroke.base_width_pt.max(0.05); stroke.points.len()];
-                build_outline_path(cr, &stroke.points, &widths, 0.5);
+                build_outline_path(&mut builder, &stroke.points, &widths, 0.5);
             }
-            true
+            builder.finish()
         }
     }
 }
 
 pub fn draw_marquee(
-    cr: &Context,
+    canvas: &mut dyn Canvas,
     kind: MarqueeKind,
     start: Point,
     current: Point,
     points: &[Point],
     view: &ViewTransform,
-) -> cairo::Result<()> {
-    cr.save()?;
-    apply_transform(cr, view)?;
+) {
+    canvas.save();
+    apply_transform(canvas, view);
     let logical_to_page = view.pt_to_logical().max(1e-6);
     let dash = 5.0 / logical_to_page;
     let gap = 4.0 / logical_to_page;
-    cr.set_dash(&[dash, gap], 0.0);
-    cr.set_line_width(1.5 / logical_to_page);
+    canvas.set_dash(&[dash, gap], 0.0);
+    canvas.set_line_width(1.5 / logical_to_page);
+
+    let mut builder = PathBuilder2::new();
     match kind {
         MarqueeKind::Rect => {
             let (x0, y0) = (start.x.min(current.x), start.y.min(current.y));
             let (x1, y1) = (start.x.max(current.x), start.y.max(current.y));
-            cr.rectangle(x0, y0, x1 - x0, y1 - y0);
+            builder.rect(x0, y0, x1 - x0, y1 - y0);
         }
         MarqueeKind::Lasso => {
             if let Some(first) = points.first() {
-                cr.move_to(first.x, first.y);
+                builder.move_to(first.x, first.y);
                 for point in &points[1..] {
-                    cr.line_to(point.x, point.y);
+                    builder.line_to(point.x, point.y);
                 }
-                cr.line_to(current.x, current.y);
-                cr.close_path();
+                builder.line_to(current.x, current.y);
+                builder.close();
             }
         }
     }
-    cr.set_source_rgba(
-        SELECTION_COLOR.0,
-        SELECTION_COLOR.1,
-        SELECTION_COLOR.2,
-        0.10,
-    );
-    cr.fill_preserve()?;
-    cr.set_source_rgba(
-        SELECTION_COLOR.0,
-        SELECTION_COLOR.1,
-        SELECTION_COLOR.2,
-        0.95,
-    );
-    cr.stroke()?;
-    cr.set_dash(&[], 0.0);
-    cr.restore()
+    if let Some(path) = builder.finish() {
+        canvas.set_color(rgba(
+            SELECTION_COLOR.0,
+            SELECTION_COLOR.1,
+            SELECTION_COLOR.2,
+            0.10,
+        ));
+        canvas.fill_path(&path);
+        canvas.set_color(rgba(
+            SELECTION_COLOR.0,
+            SELECTION_COLOR.1,
+            SELECTION_COLOR.2,
+            0.95,
+        ));
+        canvas.stroke_path(&path);
+    }
+    canvas.set_dash(&[], 0.0);
+    canvas.restore();
 }
 
 pub fn draw_layer_thumbnail(
-    cr: &Context,
+    canvas: &mut dyn Canvas,
     layer: &Layer,
     page_width_pt: f64,
     page_height_pt: f64,
     area_width: f64,
     area_height: f64,
-) -> cairo::Result<()> {
-    cr.save()?;
-    cr.set_operator(cairo::Operator::Source);
-    cr.set_source_rgb(1.0, 1.0, 1.0);
-    cr.paint()?;
-    cr.set_operator(cairo::Operator::Over);
+) {
+    canvas.save();
+    canvas.paint_with(Color::WHITE, crate::paint::Blend::Source);
     let view = ViewTransform::for_area(area_width, area_height, page_width_pt, page_height_pt);
-    draw_layer(cr, layer, &view)?;
-    cr.restore()
+    draw_layer(canvas, layer, &view);
+    canvas.restore();
 }
 
-fn apply_transform(cr: &Context, view: &ViewTransform) -> cairo::Result<()> {
+fn apply_transform(canvas: &mut dyn Canvas, view: &ViewTransform) {
     let (origin_x, origin_y) = view.origin_logical();
-    cr.translate(origin_x, origin_y);
-    cr.scale(view.pt_to_logical(), view.pt_to_logical());
-    Ok(())
+    canvas.translate(origin_x, origin_y);
+    canvas.scale(view.pt_to_logical(), view.pt_to_logical());
 }
 
-fn paint_stroke(cr: &Context, stroke: &Stroke) -> cairo::Result<()> {
+fn paint_stroke(canvas: &mut dyn Canvas, stroke: &Stroke) {
     if stroke.points.is_empty() {
-        return Ok(());
+        return;
     }
     let color = stroke.color;
-    cr.set_source_rgba(
-        color.r as f64 / 255.0,
-        color.g as f64 / 255.0,
-        color.b as f64 / 255.0,
-        color.a as f64 / 255.0,
-    );
-    paint_stroke_extra(cr, stroke, 0.0)
+    canvas.set_color(Color::new(color.r, color.g, color.b, color.a));
+    paint_stroke_extra(canvas, stroke, 0.0);
 }
 
-fn paint_stroke_extra(cr: &Context, stroke: &Stroke, extra: f64) -> cairo::Result<()> {
+fn paint_stroke_extra(canvas: &mut dyn Canvas, stroke: &Stroke, extra: f64) {
     match &stroke.widths_pt {
-        None => paint_constant_stroke(cr, stroke, extra),
-        Some(_) => paint_variable_stroke(cr, stroke, extra),
+        None => paint_constant_stroke(canvas, stroke, extra),
+        Some(_) => paint_variable_stroke(canvas, stroke, extra),
     }
 }
 
-fn paint_constant_stroke(cr: &Context, stroke: &Stroke, extra: f64) -> cairo::Result<()> {
+fn paint_constant_stroke(canvas: &mut dyn Canvas, stroke: &Stroke, extra: f64) {
     let width = stroke.base_width_pt.max(0.05);
     if stroke.points.len() == 1 {
         let point = stroke.points[0];
-        cr.new_sub_path();
-        cr.arc(point.x, point.y, width / 2.0 + extra, 0.0, 2.0 * PI);
-        return cr.fill();
+        let mut builder = PathBuilder2::new();
+        builder.circle(point.x, point.y, width / 2.0 + extra);
+        if let Some(path) = builder.finish() {
+            canvas.fill_path(&path);
+        }
+        return;
     }
-    cr.new_path();
-    cr.move_to(stroke.points[0].x, stroke.points[0].y);
+    let mut builder = PathBuilder2::new();
+    builder.move_to(stroke.points[0].x, stroke.points[0].y);
     for point in &stroke.points[1..] {
-        cr.line_to(point.x, point.y);
+        builder.line_to(point.x, point.y);
     }
-    cr.set_line_width(width + 2.0 * extra);
-    cr.stroke()
+    let Some(path) = builder.finish() else {
+        return;
+    };
+    canvas.set_line_width(width + 2.0 * extra);
+    canvas.stroke_path(&path);
 }
 
-fn paint_variable_stroke(cr: &Context, stroke: &Stroke, extra: f64) -> cairo::Result<()> {
+fn paint_variable_stroke(canvas: &mut dyn Canvas, stroke: &Stroke, extra: f64) {
     if stroke.points.len() == 1 {
         let point = stroke.points[0];
-        cr.new_sub_path();
-        cr.arc(
+        let mut builder = PathBuilder2::new();
+        builder.circle(
             point.x,
             point.y,
             stroke.width_at(0).max(0.05) / 2.0 + extra,
-            0.0,
-            2.0 * PI,
         );
-        return cr.fill();
+        if let Some(path) = builder.finish() {
+            canvas.fill_path(&path);
+        }
+        return;
     }
 
     // 采样点之间直接连直线，快速书写时点距大会出现明显折痕；
@@ -356,11 +372,19 @@ fn paint_variable_stroke(cr: &Context, stroke: &Stroke, extra: f64) -> cairo::Re
         .map(|index| stroke.width_at(index))
         .collect();
     let (points, widths) = smooth_polyline(&stroke.points, &widths);
-    build_outline_path(cr, &points, &widths, extra);
-    cr.fill()
+    let mut builder = PathBuilder2::new();
+    build_outline_path(&mut builder, &points, &widths, extra);
+    if let Some(path) = builder.finish() {
+        canvas.fill_path(&path);
+    }
 }
 
-fn build_outline_path(cr: &Context, points: &[Point], widths: &[f64], extra: f64) {
+fn build_outline_path(
+    builder: &mut PathBuilder2,
+    points: &[Point],
+    widths: &[f64],
+    extra: f64,
+) {
     let count = points.len();
     let directions: Vec<(f64, f64)> = (0..count)
         .map(|index| direction_at(points, index))
@@ -383,10 +407,9 @@ fn build_outline_path(cr: &Context, points: &[Point], widths: &[f64], extra: f64
     }
 
     let last = count - 1;
-    cr.new_path();
-    cr.move_to(left[0].x, left[0].y);
+    builder.move_to(left[0].x, left[0].y);
     for point in &left[1..] {
-        cr.line_to(point.x, point.y);
+        builder.line_to(point.x, point.y);
     }
 
     let end_half = widths[last].max(0.05) / 2.0 + extra;
@@ -397,20 +420,20 @@ fn build_outline_path(cr: &Context, points: &[Point], widths: &[f64], extra: f64
         right[last],
         Point::new(directions[last].0, directions[last].1),
     ) {
-        cr.line_to(point.x, point.y);
+        builder.line_to(point.x, point.y);
     }
 
     for point in right.iter().rev() {
-        cr.line_to(point.x, point.y);
+        builder.line_to(point.x, point.y);
     }
 
     let start_half = widths[0].max(0.05) / 2.0 + extra;
     let backward = Point::new(-directions[0].0, -directions[0].1);
     for point in cap_points(points[0], start_half, right[0], left[0], backward) {
-        cr.line_to(point.x, point.y);
+        builder.line_to(point.x, point.y);
     }
 
-    cr.close_path();
+    builder.close();
 }
 
 /// 用向心 Catmull-Rom（alpha = 0.5）把采样点加密成平滑折线。
@@ -538,6 +561,21 @@ fn normalize_angle(angle: f64) -> f64 {
         value += 2.0 * PI;
     }
     value
+}
+
+fn rgba(r: f64, g: f64, b: f64, a: f64) -> Color {
+    Color::from_rgba_f64(r, g, b, a)
+}
+
+/// 供缓存层判断某块区域是否有笔迹需要重绘（缩略图/裁剪共用）。
+pub fn stroke_bounds_logical(stroke: &Stroke, view: &ViewTransform) -> Option<RectF> {
+    if stroke.points.is_empty() {
+        return None;
+    }
+    let bounds = stroke.bounds_pt();
+    let (x0, y0) = view.page_to_logical(Point::new(bounds.0, bounds.1));
+    let (x1, y1) = view.page_to_logical(Point::new(bounds.2, bounds.3));
+    Some(RectF::from_bounds(x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)))
 }
 
 #[cfg(test)]

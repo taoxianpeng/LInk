@@ -2,13 +2,17 @@ use thiserror::Error;
 
 #[cfg(target_os = "linux")]
 pub mod x11;
+#[cfg(target_os = "windows")]
+pub mod win;
 
 /// 当前构建实际使用的后端。
 ///
 /// 上层只通过这个名字使用平台能力；接入 Windows 时只需在此处按 `cfg`
 /// 指向 `platform::win`，装配代码不用改。
 #[cfg(target_os = "linux")]
-pub use x11::{compositor_active, overlay, X11Platform as Platform};
+pub use x11::{compositor_active, X11Platform as Platform};
+#[cfg(target_os = "windows")]
+pub use win::{compositor_active, WinPlatform as Platform};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct RectI {
@@ -63,6 +67,8 @@ pub enum PlatformError {
     TransparencyUnsupported,
     #[error("窗口没有 X11 句柄")]
     NoX11Window,
+    #[error("创建窗口失败: {0}")]
+    WindowCreate(String),
     #[error("截图失败: {0}")]
     Capture(String),
     #[error("不支持的 X11 像素格式: {0}")]

@@ -1,9 +1,11 @@
 pub mod app;
 pub mod cache;
 pub mod canvas_app;
+pub mod damage;
 pub mod export;
 pub mod input;
 pub mod model;
+pub mod paint;
 pub mod platform;
 pub mod render;
 pub mod selection;

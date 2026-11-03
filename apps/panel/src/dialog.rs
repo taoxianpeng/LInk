@@ -5,6 +5,7 @@
 //! egui 的更新循环。这里改成：工作线程跑对话框，UI 每帧非阻塞轮询结果。
 
 use std::path::PathBuf;
+#[cfg(target_os = "linux")]
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 

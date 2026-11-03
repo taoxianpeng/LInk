@@ -1,6 +1,5 @@
-use cairo::{Context, Format, ImageSurface, Operator};
-
 use crate::model::Document;
+use crate::paint::{new_surface, Blend, Color, Surface};
 use crate::platform::MonitorInfo;
 use crate::render;
 use crate::view::ViewTransform;
@@ -16,7 +15,8 @@ use crate::view::ViewTransform;
 /// - 顶层图层笔数增加（正常落笔）→ 只把新增的那几笔画进缓存，O(1)；
 /// - 非顶层图层增加笔迹 → 整张重建，保证遮挡顺序正确。
 pub struct OverlayCache {
-    surface: ImageSurface,
+    surface: Box<dyn Surface>,
+    /// 逻辑坐标 → 物理像素的缩放（GPU 缩放因子）。
     scale: f64,
     names: Vec<String>,
     counts: Vec<usize>,
@@ -27,24 +27,19 @@ pub struct OverlayCache {
 }
 
 impl OverlayCache {
-    /// 按主屏逻辑尺寸建面（绘制时用逻辑坐标），并设置设备缩放，
-    /// 使缓存内部实际按物理像素栅格化，与屏幕 1:1。
+    /// 按主屏**物理像素**建面。
     ///
-    /// `scale` 必须与目标绘制表面（GTK 窗口的 cairo surface）的设备缩放一致，
-    /// 否则贴图时会被二次缩放导致模糊/错位。
+    /// 绘制坐标一律是物理像素，所以每次绘制前把调用方的逻辑视图换算到物理像素
+    /// （`ViewTransform::to_physical_pixels`），后端不再需要设备缩放概念。
     pub fn new(monitor: &MonitorInfo, scale: f64) -> Self {
         let scale = if scale.is_finite() && scale > 0.0 {
             scale
         } else {
             1.0
         };
-        // cairo 的图像表面按“设备像素”分配：先开够物理像素，再用设备缩放把
-        // 绘制坐标变回逻辑坐标，这样缓存内容与屏幕像素严格 1:1。
-        let width = (monitor.logical.width.max(1.0) * scale).ceil() as i32;
-        let height = (monitor.logical.height.max(1.0) * scale).ceil() as i32;
-        let surface =
-            ImageSurface::create(Format::ARgb32, width, height).expect("创建覆盖层缓存失败");
-        surface.set_device_scale(scale, scale);
+        let width = (monitor.logical.width.max(1.0) * scale).ceil() as u32;
+        let height = (monitor.logical.height.max(1.0) * scale).ceil() as u32;
+        let surface = new_surface(width, height).expect("创建覆盖层缓存失败");
         Self {
             surface,
             scale,
@@ -56,6 +51,7 @@ impl OverlayCache {
         }
     }
 
+    /// 缓存的物理像素缩放因子。
     pub fn scale(&self) -> f64 {
         self.scale
     }
@@ -65,13 +61,12 @@ impl OverlayCache {
         self.ready = false;
     }
 
-    /// 把缓存贴到目标上下文。缓存与目标使用相同的设备缩放，像素严格 1:1。
+    /// 把缓存贴到目标画布。
+    ///
     /// 用 Source 直接覆盖目标区域：既贴上了已提交笔迹，也把该区域里上一帧的草稿
     /// 一并抹掉，省掉一次单独的清屏（清屏会让屏幕短暂变空）。
-    pub fn paint(&self, cr: &Context) -> cairo::Result<()> {
-        cr.set_operator(Operator::Source);
-        cr.set_source_surface(&self.surface, 0.0, 0.0)?;
-        cr.paint()
+    pub fn paint(&self, canvas: &mut dyn crate::paint::Canvas) {
+        canvas.draw_surface(self.surface.as_ref(), Blend::Source);
     }
 
     /// 整张重建的次数（诊断/测试用）。
@@ -80,6 +75,9 @@ impl OverlayCache {
     }
 
     /// 让缓存与文档一致。
+    ///
+    /// `view` 必须是**设备像素**视图（调用方已用 `to_physical_pixels` 换算过）；
+    /// 缓存表面本身也是按物理像素分配的，两边 1:1，不能再乘一次缩放。
     ///
     /// - 结构/笔数都没变（指针移动的大多数帧）→ 什么都不做；
     /// - 顶层图层只多了笔迹 → 增量追加，O(1)；
@@ -91,11 +89,12 @@ impl OverlayCache {
         if self.appendable(document) {
             let top = document.layers.len() - 1;
             let from = self.counts[top];
-            if let Ok(cr) = Context::new(&self.surface) {
+            let physical = *view;
+            self.surface.with_canvas(&mut |canvas| {
                 for stroke in &document.layers[top].strokes[from..] {
-                    let _ = render::draw_stroke(&cr, stroke, view);
+                    render::draw_stroke(canvas, stroke, &physical);
                 }
-            }
+            });
             self.snapshot(document);
             return;
         }
@@ -172,15 +171,13 @@ impl OverlayCache {
         self.visibility = document.layers.iter().map(|layer| layer.visible).collect();
     }
 
-    fn rebuild(&mut self, document: &Document, view: &ViewTransform) {
+    fn rebuild(&mut self, document: &Document, physical: &ViewTransform) {
         self.rebuilds += 1;
-        if let Ok(cr) = Context::new(&self.surface) {
-            cr.set_operator(Operator::Source);
-            cr.set_source_rgba(0.0, 0.0, 0.0, 0.0);
-            let _ = cr.paint();
-            cr.set_operator(Operator::Over);
-            let _ = render::draw_document(&cr, document, view);
-        }
+        let physical = *physical;
+        self.surface.with_canvas(&mut |canvas| {
+            canvas.paint_with(Color::TRANSPARENT, Blend::Source);
+            render::draw_document(canvas, document, &physical);
+        });
         self.ready = true;
     }
 }

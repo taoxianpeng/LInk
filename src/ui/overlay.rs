@@ -1,10 +1,9 @@
 use std::cell::Cell;
 use std::time::Instant;
 
-use cairo::Context;
-
 use crate::app::App;
 use crate::cache::OverlayCache;
+use crate::paint::{Blend, Canvas, RectF};
 use crate::render;
 use crate::view::ViewTransform;
 
@@ -14,22 +13,23 @@ thread_local! {
 
 /// 只有脏区域不太大时才走「离屏组 + 一次贴图」的原子合成。
 ///
-/// cairo 的 group 会按裁剪区大小分配中间表面：小区域几乎零成本（实测每帧 0.3~0.5ms），
-/// 但整屏重绘时等于多分配 43MB。整屏重绘是图层操作、导出恢复这类一次性动作，
+/// 离屏组会按裁剪区大小分配中间表面：小区域几乎零成本（实测每帧 0.3~0.5ms），
+/// 但整屏重绘时等于多分配几十 MB。整屏重绘是图层操作、导出恢复这类一次性动作，
 /// 不会连续闪烁，直接绘制更划算。
 const ATOMIC_COMPOSE_MAX_AREA: f64 = 400_000.0;
 
-/// `damage` 是这一帧需要重绘的逻辑矩形（x0,y0,x1,y1）。
+/// `damage` 是这一帧需要重绘的逻辑矩形（x0,y0,x1,y1），与 `clip` 同为**设备像素**。
 ///
-/// GTK 在带合成器的透明窗口上往往把整屏都标记为脏，若照单全收就会每帧全屏重绘，
+/// 窗口层在带合成器的透明窗口上往往把整屏都标记为脏，若照单全收就会每帧全屏重绘，
 /// 长笔迹时能在屏幕上看到"清屏 → 重画"的间隙（闪烁）。所以这里按自己的脏矩形裁剪，
 /// 只在必要时才画整个窗口。
 pub fn draw(
-    cr: &Context,
+    canvas: &mut dyn Canvas,
     app: &App,
     view: &ViewTransform,
     cache: &mut OverlayCache,
     damage: Option<(f64, f64, f64, f64)>,
+    clip: RectF,
 ) {
     let started = Instant::now();
     let previous = LAST_FRAME.with(|slot| slot.replace(Some(started)));
@@ -37,13 +37,7 @@ pub fn draw(
 
     cache.sync(&app.document, view);
 
-    // 关键：把「贴缓存 + 画草稿」合成到一个离屏组，最后一次性贴到窗口。
-    // 否则这两步之间（清掉草稿区域 → 重画草稿）如果被合成器采样，
-    // 屏幕上会看到笔迹瞬间消失 —— 笔画越长、这一帧的耗时越久，闪得越明显。
-    let clip_area = cr
-        .clip_extents()
-        .map(|(x0, y0, x1, y1)| ((x1 - x0) * (y1 - y0)).abs())
-        .unwrap_or(f64::INFINITY);
+    let clip_area = (clip.width * clip.height).abs();
 
     // 只在小范围脏矩形上动手；没有提示或区域过大时才画整个裁剪区。
     let mut area = clip_area;
@@ -52,8 +46,7 @@ pub fn draw(
         let height = (y1 - y0).max(1.0);
         let damage_area = width * height;
         if damage_area <= ATOMIC_COMPOSE_MAX_AREA && damage_area < clip_area {
-            cr.rectangle(x0, y0, width, height);
-            cr.clip();
+            canvas.clip_rect(x0, y0, width, height);
             area = damage_area;
         }
     }
@@ -67,42 +60,42 @@ pub fn draw(
         (ax.min(bx), ay.min(by), ax.max(bx), ay.max(by))
     });
     let active = app.document.active;
-    let paint_draft = |cr: &Context| {
+    let paint_draft = |canvas: &mut dyn Canvas| {
         if let Some(draft) = &draft {
-            let _ = render::draw_stroke(cr, draft, view);
-            let _ = render::draw_layers_above(cr, &app.document, active, view, cull_pt);
+            render::draw_stroke(canvas, draft, view);
+            render::draw_layers_above(canvas, &app.document, active, view, cull_pt);
         }
         let selection = app.overlay_strokes();
         if !selection.is_empty() {
-            let _ = render::draw_selection(cr, &selection, view, app.selection_transform());
+            render::draw_selection(canvas, &selection, view, app.selection_transform());
         }
         if let Some(bounds) = app.selection_box() {
-            let _ = render::draw_selection_box(cr, bounds, app.selection_transform(), view);
+            render::draw_selection_box(canvas, bounds, app.selection_transform(), view);
         }
         if let Some((kind, start, current, points)) = app.marquee_view() {
-            let _ = render::draw_marquee(cr, kind, start, current, points, view);
+            render::draw_marquee(canvas, kind, start, current, points, view);
         }
     };
 
+    // 小区域走原子合成：组的范围必须与被裁剪的区域一致。
+    //
+    // cairo 的 `push_group` 会自己按当前裁剪区分配，但 Windows 后端（tiny-skia）需要
+    // 显式告诉它「组覆盖哪块屏幕区域」才能把组内坐标平移回原位。这里统一用
+    // `compose_bounds`：默认是整屏，按 damage 裁剪后就是脏矩形本身。
+    let compose_bounds = damage
+        .map(|(x0, y0, x1, y1)| RectF::from_bounds(x0, y0, x1, y1))
+        .unwrap_or(clip);
+
     if area > ATOMIC_COMPOSE_MAX_AREA {
         // 大区域：直接画，少一份中间表面。
-        let _ = cache.paint(cr);
-        cr.set_operator(cairo::Operator::Over);
-        paint_draft(cr);
+        cache.paint(canvas);
+        paint_draft(canvas);
     } else {
-        cr.push_group();
+        canvas.push_group(compose_bounds);
         // 组内先放已提交笔迹（Source 覆盖，顺带清掉上一帧草稿），再叠当前草稿。
-        let _ = cache.paint(cr);
-        cr.set_operator(cairo::Operator::Over);
-        paint_draft(cr);
-        if cr.pop_group_to_source().is_ok() {
-            // 关键：必须用 Source 把整块裁剪区替换掉。
-            // 组里没有笔迹的地方是**透明**的，用 Over 贴回去时这些像素不会被覆盖，
-            // 上一帧的图形就留在了屏幕上 —— 形状工具拖动时的一片残影就是这么来的
-            // （自由笔迹一直是向外长，新旧完全重叠，所以看不出来）。
-            cr.set_operator(cairo::Operator::Source);
-            let _ = cr.paint();
-        }
+        cache.paint(canvas);
+        paint_draft(canvas);
+        canvas.pop_group_to_source(compose_bounds);
     }
 
     if log::log_enabled!(log::Level::Trace) {
@@ -118,4 +111,9 @@ pub fn draw(
             cache.rebuilds(),
         );
     }
+}
+
+/// 用纯色铺满整张画布（窗口层清屏用）。
+pub fn clear(canvas: &mut dyn Canvas, color: crate::paint::Color) {
+    canvas.paint_with(color, Blend::Source);
 }

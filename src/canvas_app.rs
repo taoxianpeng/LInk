@@ -86,9 +86,47 @@ impl CanvasApp {
         std::mem::take(&mut self.redraw)
     }
 
-    /// `damage` 是这一帧要重绘的逻辑矩形（由窗口层排队时记录）。
-    pub fn draw(&mut self, cr: &cairo::Context, damage: Option<(f64, f64, f64, f64)>) {
-        crate::ui::overlay::draw(cr, &self.app, &self.view, &mut self.cache, damage);
+    /// `damage` 与 `clip` 都是**设备像素**（画布后端统一用物理像素坐标）。
+    pub fn draw(
+        &mut self,
+        canvas: &mut dyn crate::paint::Canvas,
+        damage: Option<(f64, f64, f64, f64)>,
+        clip: crate::paint::RectF,
+    ) {
+        // 渲染与缓存都按物理像素工作：后端不再持有设备缩放。
+        let physical = self.view.to_physical_pixels(self.monitor.scale);
+        crate::ui::overlay::draw(
+            canvas,
+            &self.app,
+            &physical,
+            &mut self.cache,
+            damage,
+            clip,
+        );
+    }
+
+    /// 整屏重绘时要用的裁剪矩形（设备像素）。
+    pub fn full_clip(&self) -> crate::paint::RectF {
+        let scale = self.monitor.scale.max(0.01);
+        crate::paint::RectF::new(
+            0.0,
+            0.0,
+            self.monitor.logical.width * scale,
+            self.monitor.logical.height * scale,
+        )
+    }
+
+    /// 页面 pt 的脏矩形 → 设备像素矩形（窗口层排队重绘用）。
+    pub fn damage_to_device(
+        &self,
+        damage: Option<(f64, f64, f64, f64)>,
+    ) -> Option<(f64, f64, f64, f64)> {
+        let physical = self.view.to_physical_pixels(self.monitor.scale);
+        damage.map(|(x0, y0, x1, y1)| {
+            let (ax, ay) = physical.page_to_logical(crate::model::Point::new(x0, y0));
+            let (bx, by) = physical.page_to_logical(crate::model::Point::new(x1, y1));
+            (ax.min(bx), ay.min(by), ax.max(bx), ay.max(by))
+        })
     }
 
     /// 处理一条输入事件，返回要发给面板的事件。

@@ -2,7 +2,7 @@
 name = "link-ink"
 version = "0.3.0"
 edition = "2021"
-description = "LInk screen annotation overlay for X11"
+description = "LInk screen annotation overlay (Linux/X11 + Windows)"
 license = "MIT"
 
 default-run = "link-ink-panel"
@@ -13,6 +13,7 @@ name = "link-ink-panel"
 path = "apps/panel/src/main.rs"
 
 # 原生画布进程：全屏透明覆盖层 + 压感 + 渲染 + xopp/导出。
+# 入口按平台分发（GTK / Win32），见 src/canvas_main.rs。
 [[bin]]
 name = "link-ink-canvas"
 path = "src/canvas_main.rs"
@@ -21,9 +22,6 @@ path = "src/canvas_main.rs"
 members = ["crates/link-ipc"]
 
 [dependencies]
-gtk = { version = "0.19", features = ["v3_24"] }
-cairo-rs = "0.22"
-glib = "0.22"
 flate2 = "1"
 quick-xml = "0.42"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
@@ -36,8 +34,12 @@ serde_json = "1"
 base64 = "0.22"
 
 # egui 面板（link-ink-panel）。纯 Rust，无 webview。
+#
+# 用 wgpu 后端而不是 glow：实测 eframe 0.37 + glow(WGL) 在部分 NVIDIA 驱动上
+# 只画得出一帧底色，控件内容完全不可见（最小复现程序也一样）。
+# x11/wayland 在 Windows 上是空 feature（底层依赖被 unix 目标门控），可以保留。
 eframe = { version = "0.37", default-features = false, features = [
-    "glow",
+    "wgpu",
     "default_fonts",
     "system_fonts",
     "x11",
@@ -46,11 +48,29 @@ eframe = { version = "0.37", default-features = false, features = [
 ] }
 egui = "0.37"
 rfd = "0.17"
+raw-window-handle = "0.6"
 
+# Linux/X11：画布用 GTK + cairo，输入走 GDK 的压感轴。
 [target.'cfg(target_os = "linux")'.dependencies]
+gtk = { version = "0.19", features = ["v3_24"] }
+cairo-rs = "0.22"
+glib = "0.22"
 gdkx11 = "0.19"
 x11rb = { version = "0.14", features = ["xfixes", "randr"] }
-raw-window-handle = "0.6"
+
+# Windows：画布用 Win32 分层窗口，渲染走纯 Rust 的 tiny-skia。
+[target.'cfg(target_os = "windows")'.dependencies]
+tiny-skia = "0.12"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Input_Pointer",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [dev-dependencies]
 tempfile = "3"
