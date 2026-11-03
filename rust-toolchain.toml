@@ -1,0 +1,7 @@
+# 固定工具链版本：eframe/egui 0.37 要求 rustc >= 1.95。
+# 不写这个文件时，协作者的默认 stable 若低于 1.95，`cargo build` 会因 MSRV 检查失败
+# （已构建过的 target 目录会掩盖这个问题，直到一次 `cargo clean`）。
+[toolchain]
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

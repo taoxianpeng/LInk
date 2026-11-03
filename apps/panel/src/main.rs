@@ -1492,6 +1492,31 @@ fn enable_dpi_awareness() {
     }
 }
 
+/// wgpu 后端的候选集合。
+///
+/// Windows 上**必须**排除 Vulkan：Intel HD 530（以及同代驱动）在
+/// `adapter.request_device()` 里会直接踩空指针 —— 返回不了 `Err`，
+/// 整个进程 `STATUS_ACCESS_VIOLATION`，任何运行时回退都兜不住。
+/// 主用 DX12，GL 兜底（老机器上 DX12 只剩 WARP 软件光栅时，
+/// wgpu 按设备类型会优先挑 GL 而不是 CPU 适配器）。
+/// `WGPU_BACKEND` 环境变量仍可覆盖。
+#[cfg(target_os = "windows")]
+fn wgpu_configuration() -> eframe::egui_wgpu::WgpuConfiguration {
+    use eframe::wgpu;
+
+    let mut config = eframe::egui_wgpu::WgpuConfiguration::default();
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut config.wgpu_setup {
+        setup.instance_descriptor.backends =
+            wgpu::Backends::from_env().unwrap_or(wgpu::Backends::DX12 | wgpu::Backends::GL);
+    }
+    config
+}
+
+#[cfg(not(target_os = "windows"))]
+fn wgpu_configuration() -> eframe::egui_wgpu::WgpuConfiguration {
+    eframe::egui_wgpu::WgpuConfiguration::default()
+}
+
 fn main() -> eframe::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     #[cfg(target_os = "windows")]
@@ -1510,6 +1535,7 @@ fn main() -> eframe::Result<()> {
     let viewport = viewport.with_transparent(true);
     let options = eframe::NativeOptions {
         viewport,
+        wgpu_options: wgpu_configuration(),
         ..Default::default()
     };
 

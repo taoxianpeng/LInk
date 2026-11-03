@@ -404,14 +404,9 @@ fn render(state: &mut CanvasState) {
     let _ = width;
     let _ = height;
     let mut rgba = state.frame.read_rgba();
-    // 透明像素的 alpha 抬到 1：分层窗口按像素 alpha 做命中测试，
-    // 全透明的区域会被系统当成“窗口不存在”，笔就落不到画布上。
-    // alpha=1 在屏幕上肉眼不可见，但足以让窗口参与命中。
+    // 透明像素的 alpha 抬到 BACKDROP_ALPHA，理由见该常量的注释。
     for pixel in rgba.chunks_exact_mut(4) {
         if pixel[3] == 0 {
-            // 底图 alpha 不能是 0/1：DWM 会把“几乎全透明”的层整体跳过合成，
-            // 笔迹就永远刷不出来。32 在深色/浅色背景上都几乎看不出，
-            // 但足以让窗口被当作可见层参与合成。
             pixel[3] = BACKDROP_ALPHA;
         }
     }
@@ -549,10 +544,10 @@ fn start(monitor: MonitorInfo) -> Result<(), PlatformError> {
 
     // 首帧：整屏提交一次。
     //
-    // 关键：分层窗口的命中测试是按像素 alpha 做的——如果整窗 alpha 全 0，
-    // 系统会认为窗口“不存在”，鼠标/笔事件直接穿到桌面，`WM_POINTER` 收不到。
-    // 所以底图必须是 alpha=1 的近乎透明像素（肉眼看不出），窗口才参与命中测试；
-    // 真正的“穿透”由 `WM_NCHITTEST` 返回 `HTTRANSPARENT` 实现。
+    // 关键：分层窗口的命中测试是按像素 alpha 做的——整窗全透明时系统会认为
+    // 窗口"不存在"，指针事件直接穿到桌面。所以底图要有一层肉眼几乎看不见、
+    // 但非零的 alpha（`BACKDROP_ALPHA`）；真正的"穿透"由
+    // `WM_NCHITTEST` 返回 `HTTRANSPARENT` 实现。
     STATE.with(|slot| {
         if let Some(state) = slot.borrow_mut().as_mut() {
             let rgba = near_invisible_backdrop(state.bitmap.width(), state.bitmap.height());
@@ -576,7 +571,7 @@ fn start(monitor: MonitorInfo) -> Result<(), PlatformError> {
                 | windows_sys::Win32::UI::WindowsAndMessaging::SWP_SHOWWINDOW,
         );
     }
-    log::info!("覆盖层已显示（全屏 alpha=1 底图）");
+    log::info!("覆盖层已显示（全屏 alpha={BACKDROP_ALPHA} 底图）");
 
 
     // 用 PeekMessage 而不是阻塞式 GetMessage：低级鼠标钩子的回调依赖线程消息泵，

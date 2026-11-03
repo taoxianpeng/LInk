@@ -110,7 +110,33 @@ cairo 的几项能力在 tiny-skia 里没有对应物，抽象层自己补上：
   不用 `std::process::exit`（那会跳过 `Drop`，画布变孤儿进程）
 - 背景：不透明 `PANEL_BG`（WGL/合成 alpha 在 Windows 上不可靠）
 
-## 五、已知限制
+## 五、显卡 / 渲染后端
+
+面板用 eframe 的 **wgpu** 后端（glow/WGL 在部分 NVIDIA 驱动上只画得出底色）。
+
+Windows 上**必须排除 Vulkan**：
+
+```rust
+create_new.instance_descriptor.backends =
+    wgpu::Backends::from_env().unwrap_or(wgpu::Backends::DX12 | wgpu::Backends::GL);
+```
+
+原因：Intel HD 530（及同代驱动）在 `adapter.request_device()` 内部直接踩空指针，
+进程 `STATUS_ACCESS_VIOLATION`。它**返回不了 `Err`**，所以任何运行时回退都兜不住 ——
+唯一办法是一开始就别把 Vulkan 列进候选。
+
+主用 DX12、GL 兜底：老机器上 DX12 可能只剩 WARP 软件光栅，此时 wgpu 按设备类型
+会优先挑 GL 而不是 CPU 适配器。`WGPU_BACKEND` 环境变量仍可覆盖。
+
+崩溃时的日志特征（`RUST_LOG=debug`）：
+
+```
+wgpu_core::instance] Request adapter result ... backend: Vulkan
+wgpu_hal::vulkan::adapter] Supported extensions: [...]   ← 最后一行
+→ STATUS_ACCESS_VIOLATION
+```
+
+## 六、已知限制
 
 - 只覆盖主显示器（与 Linux 版一致）
 - 面板是不透明窗口（Windows 的 WGL/合成 alpha 不稳定）
@@ -119,7 +145,14 @@ cairo 的几项能力在 tiny-skia 里没有对应物，抽象层自己补上：
 - 合成输入（`SetCursorPos` / `mouse_event`）在本机 DPI=1.75 下采样不稳定，
   自动化测试无法可靠复现绘制；真实设备请手动验收
 
-## 六、手动验收清单（Linux 侧必做）
+## 七、工具链
+
+仓库根目录的 `rust-toolchain.toml` 把工具链钉在 **1.99.1**
+（eframe/egui 0.37 要求 rustc >= 1.95）。不带这个文件时，
+协作者默认 stable 若低于 1.95，`cargo build` 会因 MSRV 检查失败 ——
+而已构建过的 `target/` 会掩盖这个问题，直到一次 `cargo clean`。
+
+## 八、手动验收清单（Linux 侧必做）
 
 由于本机没有 GTK 开发库，Linux 后端只做了逐调用 1:1 映射，未编译验证。合并前请执行：
 
