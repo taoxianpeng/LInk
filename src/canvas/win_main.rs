@@ -506,6 +506,22 @@ fn start(monitor: MonitorInfo) -> Result<(), PlatformError> {
             let _ = state.bitmap.update_window(state.hwnd, state.origin, None, false);
         }
     });
+    // 首帧就位后再显示窗口（顺序错了 DWM 会一直缓存空窗口）。
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        windows_sys::Win32::UI::WindowsAndMessaging::SetWindowPos(
+            hwnd,
+            windows_sys::Win32::UI::WindowsAndMessaging::HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            windows_sys::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
+                | windows_sys::Win32::UI::WindowsAndMessaging::SWP_NOSIZE
+                | windows_sys::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE
+                | windows_sys::Win32::UI::WindowsAndMessaging::SWP_SHOWWINDOW,
+        );
+    }
     log::info!("覆盖层已显示（全屏 alpha=1 底图）");
 
 

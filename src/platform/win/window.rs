@@ -9,8 +9,7 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowRect, LoadCursorW, RegisterClassExW,
-    SetWindowPos, ShowWindow, UpdateLayeredWindowIndirect, CS_HREDRAW, CS_VREDRAW, HMENU,
-    HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_SHOWNOACTIVATE,
+    UpdateLayeredWindowIndirect, CS_HREDRAW, CS_VREDRAW, HMENU,
     ULW_ALPHA, UPDATELAYEREDWINDOWINFO, WNDCLASSEXW, WNDPROC, WS_EX_LAYERED, WS_EX_NOACTIVATE,
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
@@ -92,18 +91,12 @@ pub fn create_overlay_window(rect: RectI) -> Result<HWND, PlatformError> {
             std::io::Error::last_os_error()
         )));
     }
-    unsafe {
-        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-        SetWindowPos(
-            hwnd,
-            HWND_TOPMOST,
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
-        );
-    }
+    // 这里**不** ShowWindow。
+    //
+    // 分层窗口必须在第一次显示之前就把位图内容提交好（`UpdateLayeredWindowIndirect`
+    // 带位置参数）。如果先 ShowWindow 再提交，DWM 会缓存“空窗口”状态，
+    // 之后所有更新都被静默忽略（实测：纯色不透明底图也刷不出来）。
+    // 调用方负责：提交首帧 → ShowWindow → SetWindowPos(HWND_TOPMOST)。
     Ok(hwnd)
 }
 

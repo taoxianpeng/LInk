@@ -4,7 +4,8 @@
 笔迹悬浮于桌面之上；一键切换穿透后，笔和鼠标回到下层应用，笔迹继续显示。
 工程文件保存为 Xournal++ 的 `.xopp` 格式，可用 Xournal++ 打开与继续编辑。
 
-当前版本：`0.3.0`（egui 面板 + 原生画布）。目前只实现 Linux/X11 后端，Wayland 与 Windows 只预留了平台边界。
+当前版本：`0.3.0`（egui 面板 + 原生画布）。Linux/X11 后端完整可用；Windows 后端已完成渲染抽象与
+Win32 画布实现，但覆盖层的屏幕合成仍有问题（见 [docs/windows.md](docs/windows.md)）。Wayland 只预留了平台边界。
 
 
 ## 架构：egui 面板 + 原生画布（两进程）
@@ -42,7 +43,8 @@ link-ink-panel (eframe/egui)  ──JSON lines(stdin/stdout)──▶  link-ink-
 | 导出图片 | ✅ | PNG / JPEG，背景可选「空白白底」或「当前屏幕」 |
 | 撤回 | ✅ | `Ctrl+Z` 撤掉最近一笔（或恢复刚擦掉的笔迹），最多 50 步 |
 | 重做 | ❌ | 本期未实现 |
-| Wayland / Windows 后端 | ❌ | 仅做边界预留，见下文 |
+| Windows 后端 | ⚠️ | 渲染/输入/截图已实现，覆盖层屏幕合成未打通，见 [docs/windows.md](docs/windows.md) |
+| Wayland 后端 | ❌ | 仅做边界预留 |
 
 ## 构建与运行
 
