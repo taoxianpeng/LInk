@@ -2,6 +2,7 @@
 
 pub mod capture;
 pub mod input;
+pub mod mouse_hook;
 pub mod overlay;
 pub mod window;
 

@@ -9,9 +9,8 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowRect, LoadCursorW, RegisterClassExW,
-    UpdateLayeredWindowIndirect, CS_HREDRAW, CS_VREDRAW, HMENU,
-    ULW_ALPHA, UPDATELAYEREDWINDOWINFO, WNDCLASSEXW, WNDPROC, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    ULW_ALPHA, UPDATELAYEREDWINDOWINFO, WNDCLASSEXW, WNDPROC, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
+    WS_POPUP, CS_HREDRAW, CS_VREDRAW, HMENU,
 };
 
 use crate::platform::{PlatformError, RectI};
@@ -68,7 +67,11 @@ pub fn register_class(wndproc: WNDPROC) -> Result<(), PlatformError> {
 pub fn create_overlay_window(rect: RectI) -> Result<HWND, PlatformError> {
     let class_name = wide(WINDOW_CLASS);
     let title = wide(WINDOW_TITLE);
-    let ex_style = WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+    // **必须**在创建时就带 `WS_EX_LAYERED`：`UpdateLayeredWindowIndirect` 只对
+    // 分层窗口有效，否则返回 87（参数错误）——而这个错误很容易被调用方忽略，
+    // 表现为「提交成功但屏幕上永远是空的」。
+    // TOPMOST / TRANSPARENT 之后再用 SetWindowPos / SetWindowLong 补。
+    let ex_style = WS_EX_LAYERED | WS_EX_TOOLWINDOW;
     let hwnd = unsafe {
         CreateWindowExW(
             ex_style,
@@ -259,9 +262,15 @@ impl LayeredBitmap {
             right: dirty.x1,
             bottom: dirty.y1,
         });
+        // 与 gink 对齐：`hdcDst` 传**屏幕 DC**（不是 NULL），
+        // 且每次都用非 Indirect 的 `UpdateLayeredWindow` 传全量参数。
+        //
+        // 参考 https://github.com/geovens/gink/blob/master/src/FormDisplay.cs
+        // 的 `UpdateFormDisplay`：它就是这种调用方式，在分层窗口上稳定生效。
+        let screen_dc = unsafe { windows_sys::Win32::Graphics::Gdi::GetDC(std::ptr::null_mut()) };
         let info = UPDATELAYEREDWINDOWINFO {
             cbSize: std::mem::size_of::<UPDATELAYEREDWINDOWINFO>() as u32,
-            hdcDst: std::ptr::null_mut(),
+            hdcDst: screen_dc,
             pptDst: if positioned {
                 std::ptr::null()
             } else {
@@ -295,7 +304,23 @@ impl LayeredBitmap {
                 0,
             );
         }
-        let ok = unsafe { UpdateLayeredWindowIndirect(hwnd, &info) };
+        let ok = unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::UpdateLayeredWindow(
+                hwnd,
+                screen_dc,
+                &point,
+                &size,
+                self.hdc,
+                &source,
+                0,
+                &blend,
+                windows_sys::Win32::UI::WindowsAndMessaging::ULW_ALPHA,
+            )
+        };
+        unsafe {
+            windows_sys::Win32::Graphics::Gdi::ReleaseDC(std::ptr::null_mut(), screen_dc);
+        }
+        let _ = &info;
         if ok == 0 {
             return Err(PlatformError::WindowCreate(format!(
                 "UpdateLayeredWindowIndirect 失败：{}",

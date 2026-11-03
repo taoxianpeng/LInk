@@ -13,7 +13,7 @@ use std::sync::mpsc;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, PeekMessageW, PostMessageW, PostQuitMessage, SetTimer,
+    DispatchMessageW, PeekMessageW, PostMessageW, PostQuitMessage, SetTimer,
     ShowWindow, TranslateMessage, MSG, PM_REMOVE, SW_HIDE, SW_SHOWNOACTIVATE, WM_APP, WM_CLOSE,
     WM_DESTROY, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WM_TIMER,
 };
@@ -25,6 +25,7 @@ use link_ink::damage::{merge_scope, union_rect, DamageRect, DrawScope};
 use link_ink::input::InputEvent;
 use link_ink::paint::{new_surface, RectF, Surface};
 use link_ink::platform::win::input::{self, PointerPhase};
+use link_ink::platform::win::mouse_hook::{self, MouseHook, MousePhase as HookPhase};
 use link_ink::platform::win::overlay::{self, lparam_point};
 use link_ink::platform::win::window::{self, DirtyRect, LayeredBitmap};
 use link_ink::platform::win::WinPlatform;
@@ -34,6 +35,8 @@ use link_ink::platform::{CaptureImage, MonitorInfo, PlatformError};
 const WM_APP_COMMAND: u32 = WM_APP + 1;
 /// 面板矩形刷新定时器（与 Linux 的 400 ms 一致）。
 const TIMER_PANEL: usize = 1;
+/// 鼠标钩子队列的消费定时器。
+const TIMER_PUMP: usize = 2;
 const PANEL_INTERVAL_MS: u32 = 400;
 /// 隐藏覆盖层后等待 DWM 出帧的时间（约两帧 @60Hz）。
 const CAPTURE_DELAY_MS: u64 = 150;
@@ -46,6 +49,8 @@ struct CanvasState {
     frame: Box<dyn Surface>,
     bitmap: LayeredBitmap,
     origin: (i32, i32),
+    /// 物理像素 / 逻辑像素（鼠标钩子给的是屏幕物理坐标）。
+    scale: f64,
     /// 待绘制的范围（多个输入事件合并后取并集）。
     pending: Option<DrawScope>,
     /// 上一帧画过的脏矩形，用于把两帧的矩形并起来。
@@ -104,6 +109,11 @@ impl CanvasHost for WinHost {
 }
 
 thread_local! {
+    static MOUSE_RX: RefCell<Option<mpsc::Receiver<mouse_hook::MouseEvent>>> =
+        const { RefCell::new(None) };
+}
+
+thread_local! {
     static STATE: RefCell<Option<Box<CanvasState>>> = const { RefCell::new(None) };
 }
 
@@ -114,8 +124,11 @@ unsafe extern "system" fn wndproc(
     lparam: LPARAM,
 ) -> LRESULT {
     let result = match msg {
-        // 系统用 WM_NCCREATE 的返回值决定是否继续创建窗口；必须返回非 0。
-        windows_sys::Win32::UI::WindowsAndMessaging::WM_NCCREATE => 1,
+        // WM_NCCREATE 必须交给 DefWindowProcW：它负责初始化窗口内部状态并返回 TRUE。
+        // 直接返回 1 会让分层窗口的合成状态不完整。
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_NCCREATE => {
+            window::default_wndproc(hwnd, msg, wparam, lparam)
+        }
         WM_NCHITTEST => {
             let (x, y) = overlay::lparam_point(lparam);
             overlay::hit_test(x, y)
@@ -167,6 +180,10 @@ unsafe extern "system" fn wndproc(
         }
         WM_APP_COMMAND => {
             handle_commands();
+            0
+        }
+        WM_TIMER if wparam == TIMER_PUMP => {
+            pump_mouse_hook();
             0
         }
         WM_TIMER if wparam == TIMER_PANEL => {
@@ -241,6 +258,37 @@ fn handle_mouse(lparam: LPARAM, phase: MousePhase) {
         MousePhase::Up => InputEvent::Up(sample),
     };
     push_input(event);
+}
+
+/// 消费鼠标钩子队列（由 8 ms 定时器驱动）。
+///
+/// 鼠标为什么走钩子而不是窗口消息：覆盖层是分层窗口，命中测试按像素 alpha 判断，
+/// 近乎全透明的底图会让鼠标消息直接穿透到桌面；即使能收到，
+/// `WM_POINTER` 对鼠标也会把整次拖拽合并成极少几条消息。
+/// 低级钩子由系统在所有鼠标事件上回调，与焦点/命中/窗口样式无关。
+fn pump_mouse_hook() {
+    MOUSE_RX.with(|slot| {
+        let mut borrow = slot.borrow_mut();
+        let Some(rx) = borrow.as_mut() else {
+            return;
+        };
+        while let Ok(event) = rx.try_recv() {
+            let (origin, scale) = STATE.with(|state| {
+                state
+                    .borrow()
+                    .as_ref()
+                    .map(|state| (state.origin, state.scale))
+                    .unwrap_or(((0, 0), 1.0))
+            });
+            let sample = mouse_hook::to_sample(event, origin, scale);
+            let input = match event.phase {
+                HookPhase::Down => InputEvent::Down(sample),
+                HookPhase::Move => InputEvent::Move(sample),
+                HookPhase::Up => InputEvent::Up(sample),
+            };
+            push_input(input);
+        }
+    });
 }
 
 fn push_input(event: InputEvent) {
@@ -376,13 +424,11 @@ fn render(state: &mut CanvasState) {
     }
 }
 
-/// 全屏 alpha=1 的底图：让分层窗口参与命中测试，同时肉眼不可见。
 /// 全屏底图的 alpha。
 ///
-/// 分层窗口的命中测试按像素 alpha 判断，全透明区域会被系统当成“窗口不存在”；
-/// 同时 DWM 对整层近乎全透明（alpha ≤ 1）的窗口会跳过合成，笔迹刷不出来。
-/// 32 是实测能同时满足“肉眼几乎不可见”和“稳定参与合成”的值。
-const BACKDROP_ALPHA: u8 = 32;
+/// - 0/1：DWM 会跳过整层合成，笔迹永远刷不出来（实测）；
+/// - 8：深色/浅色背景上都几乎看不出，同时能稳定参与合成与命中测试。
+const BACKDROP_ALPHA: u8 = 8;
 
 fn near_invisible_backdrop(width: u32, height: u32) -> Vec<u8> {
     let mut rgba = vec![0u8; (width * height * 4) as usize];
@@ -432,6 +478,12 @@ pub fn run() -> i32 {
 }
 
 fn start(monitor: MonitorInfo) -> Result<(), PlatformError> {
+    // 鼠标走全局低级钩子（见 `pump_mouse_hook` 的说明）。
+    // 钩子句柄必须活到进程结束（Drop 时 UnhookWindowsHookEx）。
+    let (_mouse_hook, mouse_rx) = match MouseHook::install() {
+        Some((hook, rx)) => (Some(hook), Some(rx)),
+        None => (None, None),
+    };
     window::register_class(Some(wndproc))?;
     let hwnd = window::create_overlay_window(monitor.physical)?;
     overlay::refresh_panel_rect();
@@ -482,12 +534,14 @@ fn start(monitor: MonitorInfo) -> Result<(), PlatformError> {
         frame,
         bitmap,
         origin: (monitor.physical.x, monitor.physical.y),
+        scale: monitor.scale,
         pending: Some(DrawScope::Full),
         last_damage: None,
         quit: false,
         rx,
     });
     STATE.with(|slot| *slot.borrow_mut() = Some(state));
+    MOUSE_RX.with(|slot| *slot.borrow_mut() = mouse_rx);
 
     unsafe {
         SetTimer(hwnd, TIMER_PANEL, PANEL_INTERVAL_MS, None);
@@ -525,11 +579,15 @@ fn start(monitor: MonitorInfo) -> Result<(), PlatformError> {
     log::info!("覆盖层已显示（全屏 alpha=1 底图）");
 
 
+    // 用 PeekMessage 而不是阻塞式 GetMessage：低级鼠标钩子的回调依赖线程消息泵，
+    // 阻塞在 GetMessage 时钩子事件会大量丢失。
     let mut msg = MSG::default();
     loop {
-        let got = unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) };
-        if got <= 0 {
-            break;
+        let got = unsafe { PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) };
+        if got == 0 {
+            pump_mouse_hook();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            continue;
         }
         unsafe {
             TranslateMessage(&msg);
