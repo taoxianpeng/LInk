@@ -94,7 +94,7 @@ fn emit(events: Vec<Event>) {
 }
 
 pub fn run() -> glib::ExitCode {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    link_ink::logfile::init("info");
 
     let app = gtk::Application::builder()
         .application_id("io.github.linkink.Canvas")

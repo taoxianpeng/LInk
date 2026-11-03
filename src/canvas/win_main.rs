@@ -448,7 +448,7 @@ fn emit(events: Vec<Event>) {
 }
 
 pub fn run() -> i32 {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    link_ink::logfile::init("info");
 
     let platform = match WinPlatform::new() {
         Ok(platform) => platform,

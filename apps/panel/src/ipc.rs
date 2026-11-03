@@ -23,6 +23,9 @@ impl CanvasClient {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
+            // 告诉画布"你是画布进程"，让它写 link-canvas.log 而不是
+            // link-panel.log（两个进程写同一文件会互相覆盖）。
+            .env("LINK_LOG_ROLE", "canvas")
             .spawn()
             .map_err(|error| format!("启动画布失败（{}）：{error}", binary.display()))?;
 

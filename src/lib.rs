@@ -4,6 +4,7 @@ pub mod canvas_app;
 pub mod damage;
 pub mod export;
 pub mod input;
+pub mod logfile;
 pub mod model;
 pub mod paint;
 pub mod platform;

@@ -1181,6 +1181,24 @@ impl PanelApp {
                             .on_hover_text(path.display().to_string());
                     }
                 });
+                // 日志只在 debug 构建里落盘（见 link_ink::logfile）。
+                if cfg!(debug_assertions) {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button("打开日志目录")
+                            .on_hover_text("反馈问题时把这个目录里的 link.log 发出来")
+                            .clicked()
+                        {
+                            if let Some(dir) = link_ink::logfile::log_dir() {
+                                open_in_file_manager(&dir);
+                            }
+                        }
+                        if let Some(path) = link_ink::logfile::log_path() {
+                            ui.label(RichText::new("日志").font(small()).color(DIM))
+                                .on_hover_text(path.display().to_string());
+                        }
+                    });
+                }
             });
 
         if width_changed {
@@ -1458,6 +1476,33 @@ fn raise_window(hwnd: isize) {
 #[cfg(not(any(unix, target_os = "windows")))]
 fn raise_window(_window: isize) {}
 
+/// 用系统文件管理器打开一个目录（Windows: explorer，Linux: xdg-open）。
+///
+/// 失败只记日志：用户可能在没有文件管理器的环境里跑。
+fn open_in_file_manager(dir: &std::path::Path) {
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = std::process::Command::new("explorer");
+        command.arg(dir);
+        command
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = {
+        let mut command = std::process::Command::new("xdg-open");
+        command.arg(dir);
+        command
+    };
+    #[cfg(not(any(unix, target_os = "windows")))]
+    let mut command = {
+        log::info!("请手动打开日志目录：{}", dir.display());
+        return;
+    };
+
+    if let Err(error) = command.spawn() {
+        log::warn!("打开日志目录失败（{}）：{error}", dir.display());
+    }
+}
+
 /// 固定宽度的字段名，保证滑杆左端对齐。
 fn field_label(ui: &mut egui::Ui, text: &str) {
     ui.allocate_ui_with_layout(
@@ -1518,7 +1563,7 @@ fn wgpu_configuration() -> eframe::egui_wgpu::WgpuConfiguration {
 }
 
 fn main() -> eframe::Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    link_ink::logfile::init("info");
     #[cfg(target_os = "windows")]
     enable_dpi_awareness();
 
